@@ -21,3 +21,6 @@ build/
 
 # macOS
 .DS_Store
+
+# Claude Code 用のプロジェクトメモ
+CLAUDE.md
