@@ -9,9 +9,12 @@ import SwiftUI
 
 @main
 struct KonsoleApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
     var body: some Scene {
-        WindowGroup {
-            ContentView()
+        // The real settings window is managed by AppDelegate.
+        Settings {
+            EmptyView()
         }
     }
 }

@@ -6,6 +6,10 @@
 	objectVersion = 110;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		1CAE2B2AFD13D85C1DE5E7F2 /* WhisperCpp in Frameworks */ = {isa = PBXBuildFile; productRef = 9D1E46761FEC006EECB9CB4E /* WhisperCpp */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		977E8552306668CB00F370D1 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -51,6 +55,7 @@
 		977E8541306668CA00F370D1 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
+				1CAE2B2AFD13D85C1DE5E7F2 /* WhisperCpp in Frameworks */,
 			);
 		};
 		977E854E306668CB00F370D1 /* Frameworks */ = {
@@ -103,6 +108,9 @@
 				977E8546306668CA00F370D1 /* Konsole */,
 			);
 			name = Konsole;
+			packageProductDependencies = (
+				9D1E46761FEC006EECB9CB4E /* WhisperCpp */,
+			);
 			productName = Konsole;
 			productReference = 977E8544306668CA00F370D1 /* Konsole.app */;
 			productType = "com.apple.product-type.application";
@@ -181,6 +189,9 @@
 			);
 			mainGroup = 977E853B306668CA00F370D1;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				5FC118E0ADBA17D6723DEDC2 /* XCLocalSwiftPackageReference "Packages/WhisperCpp" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 977E8545306668CA00F370D1 /* Products */;
 			projectDirPath = "";
@@ -372,12 +383,15 @@
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 87KC957S8D;
-				ENABLE_APP_SANDBOX = YES;
+				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
+				ENABLE_RESOURCE_ACCESS_AUDIO_INPUT = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_LSUIElement = YES;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "コンがあなたの声を聞き取るためにマイクを使用します。";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -404,12 +418,15 @@
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 87KC957S8D;
-				ENABLE_APP_SANDBOX = YES;
+				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
+				ENABLE_RESOURCE_ACCESS_AUDIO_INPUT = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_LSUIElement = YES;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "コンがあなたの声を聞き取るためにマイクを使用します。";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -543,6 +560,21 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		5FC118E0ADBA17D6723DEDC2 /* XCLocalSwiftPackageReference "Packages/WhisperCpp" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Packages/WhisperCpp;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		9D1E46761FEC006EECB9CB4E /* WhisperCpp */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 5FC118E0ADBA17D6723DEDC2 /* XCLocalSwiftPackageReference "Packages/WhisperCpp" */;
+			productName = WhisperCpp;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 977E853C306668CA00F370D1 /* Project object */;
 	validationLevel = 1;

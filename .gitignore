@@ -1,0 +1,23 @@
+# 会話履歴（個人の会話ログ。絶対に公開しない）
+History/
+
+# Claude Code のローカル設定
+.claude/
+
+# Xcode
+xcuserdata/
+DerivedData/
+build/
+*.xcscmblueprint
+*.xccheckout
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# カバレッジ
+*.profraw
+*.profdata
+
+# macOS
+.DS_Store
