@@ -3,6 +3,7 @@ import Foundation
 enum KonOverlayPhase: Equatable {
     case hidden
     case listening
+    case transcribing
     case thinking
     case reply(text: String, actions: [String])
 }
@@ -18,6 +19,10 @@ final class KonOverlayViewModel {
 
     func showListening() {
         phase = .listening
+    }
+
+    func showTranscribing() {
+        phase = .transcribing
     }
 
     func showThinking() {

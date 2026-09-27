@@ -48,22 +48,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 NSSound(named: "Tink")?.play()
             }
         }
-        // Escape cancels a voice session, but is only grabbed while listening
-        // so it keeps working normally in every other app.
-        chatViewModel.onListenerStateChange = { [weak self] state in
+        // Escape stops whatever Kon is doing (listening, thinking, speaking),
+        // but is only grabbed meanwhile so it keeps working in every other app.
+        chatViewModel.onBusyChange = { [weak self] isBusy in
             guard let self else { return }
-            if state == .listening {
+            if isBusy {
                 hotKeyManager.register(.cancel) { [weak self] in
-                    self?.chatViewModel.cancelVoiceSession()
+                    self?.chatViewModel.cancelCurrentActivity()
                 }
             } else {
                 hotKeyManager.unregister(.cancel)
             }
         }
-        chatViewModel.onListeningEndedWithoutCommand = { [weak self] in
+        chatViewModel.onCancel = { [weak self] in
+            self?.hideOverlay()
+        }
+        chatViewModel.onTranscribingStart = { [weak self] in
             guard self?.overlayViewModel.phase == .listening else { return }
-            self?.overlayViewModel.hide()
-            self?.overlayPanel.orderOut(nil)
+            self?.overlayViewModel.showTranscribing()
+        }
+        chatViewModel.onListeningEndedWithoutCommand = { [weak self] reason in
+            guard let self else { return }
+            let phase = overlayViewModel.phase
+            guard phase == .listening || phase == .transcribing else { return }
+            // Say why nothing happened, rather than just vanishing.
+            if let message = Self.message(for: reason) {
+                showReplyOverlay(KonReply(text: message, actions: []), isSpoken: false)
+            } else {
+                hideOverlay()
+            }
         }
         chatViewModel.onActivity = { [weak self] in
             self?.overlayHideTask?.cancel()
@@ -71,16 +84,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.showOverlay()
         }
         chatViewModel.onReply = { [weak self] reply in
-            guard let self else { return }
-            overlayHideTask?.cancel()
-            overlayViewModel.showReply(text: reply.text, actions: reply.actions)
-            showOverlay()
-            if !settings.speakReplies {
-                // Nothing to sync to: scroll at a comfortable reading pace instead.
-                let readingTime = Double(reply.text.count) / Self.readingCharactersPerSecond
-                overlayViewModel.startReading(duration: readingTime)
-                scheduleOverlayAutoHide(after: readingTime + settings.replyDisplaySeconds)
-            }
+            self?.showReplyOverlay(reply)
+        }
+        chatViewModel.onFailure = { [weak self] reply, isSpoken in
+            self?.showReplyOverlay(reply, isSpoken: isSpoken)
+        }
+        chatViewModel.onAnnouncement = { [weak self] text in
+            self?.showReplyOverlay(KonReply(text: text, actions: ["リマインダー"]))
         }
         chatViewModel.onSpeechStart = { [weak self] duration in
             self?.overlayViewModel.startReading(duration: duration)
@@ -93,6 +103,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Push-to-talk (⌥Space by default): the mic is only on during a voice session.
         hotKeyManager.register(.pushToTalk) { [weak self] in
             self?.chatViewModel.toggleVoiceSession()
+        }
+
+        let reminders = KonReminderStore.shared
+        reminders.onFire = { [weak self] reminder in
+            self?.chatViewModel.announce(reminder.text)
+        }
+        reminders.start()
+    }
+
+    // whisper.cpp's Metal backend asserts in its C++ static destructors when
+    // the process exits with a model loaded (GGML_ASSERT rsets count == 0),
+    // turning every quit — the menu, `osascript ... to quit` from the update
+    // script — into a crash report. Nothing left needs exit-time cleanup
+    // (the claude subprocess sees stdin close and exits), so skip them.
+    func applicationWillTerminate(_ notification: Notification) {
+        UserDefaults.standard.synchronize()
+        fflush(stdout)
+        fflush(stderr)
+        _exit(0)
+    }
+
+    // Kon schedules reminders by running `open -g "konsole://remind?..."`.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls {
+            KonReminderStore.shared.handle(url)
         }
     }
 
@@ -123,6 +158,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showContextMenu() {
         let menu = NSMenu()
         menu.addItem(withTitle: "設定…", action: #selector(openSettings), keyEquivalent: ",").target = self
+        let updateItem = menu.addItem(withTitle: KonUpdater.shared.state == .building ? "更新中…" : "最新のソースで更新", action: #selector(updateFromSource), keyEquivalent: "")
+        updateItem.target = self
+        updateItem.isEnabled = KonUpdater.shared.state != .building
         menu.addItem(.separator())
         // Target NSApp explicitly: AppDelegate doesn't implement terminate(_:),
         // so targeting self left this item permanently disabled.
@@ -130,6 +168,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
         statusItem.button?.performClick(nil)
         statusItem.menu = nil
+    }
+
+    @objc private func updateFromSource() {
+        KonUpdater.shared.update()
+        // Failures are shown in 設定 > 一般; open it so they aren't missed.
+        openSettings()
     }
 
     // An AppKit-owned window: SwiftUI's Settings scene can't be opened
@@ -205,6 +249,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private static let readingCharactersPerSecond = 8.0
+
+    /// `isSpoken`: whether the text is about to be read aloud, which then
+    /// drives scrolling and hiding; otherwise it scrolls at reading pace.
+    private func showReplyOverlay(_ reply: KonReply, isSpoken: Bool? = nil) {
+        overlayHideTask?.cancel()
+        overlayViewModel.showReply(text: reply.text, actions: reply.actions)
+        showOverlay()
+        if !(isSpoken ?? settings.speakReplies) {
+            // Nothing to sync to: scroll at a comfortable reading pace instead.
+            let readingTime = Double(reply.text.count) / Self.readingCharactersPerSecond
+            overlayViewModel.startReading(duration: readingTime)
+            scheduleOverlayAutoHide(after: readingTime + settings.replyDisplaySeconds)
+        }
+    }
+
+    private static func message(for reason: KonListenEndReason) -> String? {
+        switch reason {
+        case .cancelled: return nil
+        case .noSpeech: return "何も聞こえなかったよ。もう一度話しかけてね。"
+        case .micUnavailable: return "マイクの音が届かなかったよ。入力デバイスを確認してね。"
+        case .tooShort: return "短すぎて聞き取れなかったよ。"
+        case .notUnderstood: return "うまく聞き取れなかったよ。もう一度話してね。"
+        case .failed: return "文字起こしに失敗したよ。"
+        }
+    }
+
+    private func hideOverlay() {
+        overlayHideTask?.cancel()
+        overlayViewModel.hide()
+        overlayPanel.orderOut(nil)
+    }
 
     private func scheduleOverlayAutoHide(after seconds: TimeInterval) {
         overlayHideTask?.cancel()

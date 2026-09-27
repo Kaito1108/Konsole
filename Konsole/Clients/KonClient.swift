@@ -2,21 +2,85 @@ import Foundation
 
 enum KonClientError: Error, LocalizedError {
     case claudeExecutableNotFound
+    /// The user cut the reply off (barge-in / Escape); not shown as an error.
+    case interrupted
     case processLaunchFailed(String)
     case invalidResponse
     case agentError(String)
+    /// Claude's subscription usage limit is used up; `resetsAt` is when it refills.
+    case usageLimit(resetsAt: Date?, kind: String?)
+    /// Anthropic's servers are overloaded (HTTP 529); retrying later helps.
+    case overloaded
 
     var errorDescription: String? {
         switch self {
         case .claudeExecutableNotFound:
             return "claude CLIが見つかりません。インストール済みか確認してください。"
+        case .interrupted:
+            return "中断しました。"
         case .processLaunchFailed(let message):
             return "claude CLIの起動に失敗しました: \(message)"
         case .invalidResponse:
             return "claude CLIの応答を解析できませんでした。"
         case .agentError(let message):
             return message
+        case .usageLimit(let resetsAt, let kind):
+            var text = "Claudeの\(Self.limitName(kind))に達しちゃったから、今は答えられないよ。"
+            if let resetsAt {
+                text += "\(Self.resetTime(resetsAt))ごろにまた使えるようになるよ。"
+            } else {
+                text += "上限がリセットされるまで少し待ってね。"
+            }
+            return text
+        case .overloaded:
+            return "Claudeのサーバーが混み合ってて答えられなかったよ。少し待ってからもう一度話しかけてね。"
         }
+    }
+
+    private static func limitName(_ kind: String?) -> String {
+        switch kind {
+        case "five_hour": return "5時間ごとの利用上限"
+        case let kind? where kind.hasPrefix("seven_day"): return "1週間の利用上限"
+        default: return "利用上限"
+        }
+    }
+
+    /// "18時30分" today, "明日の9時" tomorrow, "10月2日(木) 9時" beyond.
+    private static func resetTime(_ date: Date) -> String {
+        let calendar = Calendar.current
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "ja_JP")
+        let minute = calendar.component(.minute, from: date)
+        let clock = minute == 0 ? "H時" : "H時m分"
+        if calendar.isDateInToday(date) {
+            formatter.dateFormat = clock
+            return formatter.string(from: date)
+        }
+        if calendar.isDateInTomorrow(date) {
+            formatter.dateFormat = clock
+            return "明日の" + formatter.string(from: date)
+        }
+        formatter.dateFormat = "M月d日(E) " + clock
+        return formatter.string(from: date)
+    }
+
+    /// Reads a limit or overload out of the CLI's error text, for when no
+    /// `rate_limit_event` said so (older CLIs, or a message-only failure).
+    static func classify(errorText text: String) -> KonClientError? {
+        let lower = text.lowercased()
+        // Old format: "Claude AI usage limit reached|1759000000".
+        if lower.contains("usage limit reached") {
+            let epoch = text.split(separator: "|").last.flatMap { TimeInterval($0.trimmingCharacters(in: .whitespaces)) }
+            return .usageLimit(resetsAt: epoch.map { Date(timeIntervalSince1970: $0) }, kind: nil)
+        }
+        if lower.contains("hit your limit") || lower.contains("out of extra usage")
+            || lower.contains("rate_limit_error") || lower.contains("rate limit") {
+            return .usageLimit(resetsAt: nil, kind: nil)
+        }
+        if lower.contains("overloaded") || lower.range(of: #"\b529\b"#, options: .regularExpression) != nil {
+            return .overloaded
+        }
+        return nil
     }
 }
 
@@ -40,6 +104,9 @@ actor KonClient {
     - ユーザーが「詳しく」などと明示的に求めたときだけ長めに答えてよい。
     - ユーザー発言の先頭にある［現在日時］は参考情報。日付・時刻・曜日を聞かれたらツールを使わずそれで答える。
     - Gmail・カレンダーなど外部サービスの操作は composio のMCPツールを使う。未接続のサービスは、Konsoleの設定の「連携」から接続するよう伝える。
+    - ユーザー発言の先頭にある［作業状況］は、ユーザーが今見ているアプリ・ファイル・ページ・クリップボードの参考情報。「これ」「このファイル」「さっきコピーしたの」などの指示語はこれで解釈する。関係ないときは触れない。
+    - 「25分後に教えて」「17時に〇〇って言って」のようなタイマー・リマインダーは、Bashで open -g "konsole://remind?in=秒数&text=読み上げる一言" または open -g "konsole://remind?at=UNIX秒&text=読み上げる一言" を実行して登録する。textはURLエンコードし、時刻になったらそのまま読み上げられる一言にする（例: 25分たったよ、休憩しよう）。at は date -j -f "%Y-%m-%d %H:%M" "2026-01-01 17:00" +%s のように求める。
+    - 登録済みリマインダーは \(KonReminderStore.fileURL.path(percentEncoded: false)) にJSONで保存されている。取り消しは open -g "konsole://remind/cancel?id=ID"、全部なら open -g "konsole://remind/cancel?all=1"。
     """
 
     private var claudeExecutablePath: String?
@@ -52,8 +119,18 @@ actor KonClient {
     private var process: Process?
     private var stdin: FileHandle?
     private var reader: KonLineReader?
-    /// MCP config the running process was started with; a change means restart.
-    private var processMCPConfig: String?
+    /// MCP config + system prompt the running process was started with; a
+    /// change (e.g. a newly connected account) means restart.
+    private var processConfig: ProcessConfig?
+    /// Set when the user cuts the current reply off.
+    private var isInterrupting = false
+    private var interruptFallbackTask: Task<Void, Never>?
+    private static let interruptGracePeriod: Duration = .seconds(3)
+
+    private struct ProcessConfig: Equatable {
+        let mcpConfig: String?
+        let systemPrompt: String
+    }
     /// Stops the idle CLI so it doesn't hold ~300MB while Kon isn't being used.
     /// The next request restarts it and resumes the conversation via sessionId.
     private var idleShutdownTask: Task<Void, Never>?
@@ -62,25 +139,38 @@ actor KonClient {
 
     /// Starts the CLI ahead of the first request so it's ready when Kon is called.
     func prewarm() async {
-        let mcpConfig = await KonComposioStore.shared.mcpConfigJSON()
-        try? await ensureProcess(mcpConfig: mcpConfig)
+        guard !isSending else { return }
+        try? await ensureProcess(config: await currentConfig())
         scheduleIdleShutdown()
     }
 
-    func send(_ prompt: String) async throws -> KonReply {
+    /// - Parameter context: What the user is working on (see KonContextProvider).
+    func send(_ prompt: String, context: String? = nil) async throws -> KonReply {
+        // A barge-in sends the next request while the interrupted one is still
+        // draining its output; the pipe carries one turn at a time.
+        while isSending {
+            try await Task.sleep(for: .milliseconds(50))
+        }
         idleShutdownTask?.cancel()
         isSending = true
+        isInterrupting = false
         defer {
             isSending = false
+            isInterrupting = false
+            interruptFallbackTask?.cancel()
             scheduleIdleShutdown()
         }
-        let mcpConfig = await KonComposioStore.shared.mcpConfigJSON()
-        try await ensureProcess(mcpConfig: mcpConfig)
+        try await ensureProcess(config: await currentConfig())
         guard let stdin, let reader else { throw KonClientError.invalidResponse }
 
+        var content = Self.contextPrefix()
+        if let context, !context.isEmpty {
+            content += "［作業状況］\n\(context)\n［ここまで］\n"
+        }
+        content += prompt
         let message: [String: Any] = [
             "type": "user",
-            "message": ["role": "user", "content": Self.contextPrefix() + prompt]
+            "message": ["role": "user", "content": content]
         ]
         var line = try JSONSerialization.data(withJSONObject: message)
         line.append(0x0A)
@@ -92,6 +182,8 @@ actor KonClient {
         }
 
         var actions: [String] = []
+        /// Set when the CLI reports the request was refused for the usage limit.
+        var rejection: KonClientError?
         while let line = await reader.nextLine() {
             guard let lineData = line.data(using: .utf8),
                   let event = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
@@ -100,12 +192,28 @@ actor KonClient {
             switch eventType {
             case "assistant":
                 actions.append(contentsOf: Self.actionSummaries(fromAssistantEvent: event))
+                // "rate_limit" also covers e.g. a model being unavailable, so
+                // only the wording decides whether it's the usage limit.
+                if event["error"] as? String == "rate_limit", rejection == nil,
+                   case .usageLimit? = KonClientError.classify(errorText: Self.text(ofAssistantEvent: event)) {
+                    rejection = .usageLimit(resetsAt: nil, kind: nil)
+                }
+            case "rate_limit_event":
+                if let info = event["rate_limit_info"] as? [String: Any],
+                   info["status"] as? String == "rejected" {
+                    rejection = .usageLimit(resetsAt: Self.date(from: info["resetsAt"]), kind: info["rateLimitType"] as? String)
+                }
             case "result":
                 if let id = event["session_id"] as? String {
                     sessionId = id
                 }
+                if isInterrupting {
+                    throw KonClientError.interrupted
+                }
                 let result = (event["result"] as? String) ?? ""
                 if (event["is_error"] as? Bool) ?? false {
+                    if let rejection { throw rejection }
+                    if let classified = KonClientError.classify(errorText: result) { throw classified }
                     throw KonClientError.agentError(result.isEmpty ? "エラーが発生しました。" : result)
                 }
                 return KonReply(text: result, actions: actions)
@@ -114,11 +222,28 @@ actor KonClient {
             }
         }
 
-        // stdout closed before a result: the CLI died. The next send restarts
-        // it and resumes the conversation via sessionId.
+        // stdout closed before a result: the CLI died (or was stopped because
+        // an interrupt went unanswered). The next send restarts it and resumes
+        // the conversation via sessionId.
         let errorText = reader.errorTail
         stopProcess()
+        if isInterrupting {
+            throw KonClientError.interrupted
+        }
+        if let rejection { throw rejection }
+        if let classified = KonClientError.classify(errorText: errorText) { throw classified }
         throw KonClientError.processLaunchFailed(errorText.isEmpty ? "claude CLIが終了しました" : errorText)
+    }
+
+    private static func text(ofAssistantEvent event: [String: Any]) -> String {
+        let blocks = (event["message"] as? [String: Any])?["content"] as? [[String: Any]] ?? []
+        return blocks.compactMap { $0["text"] as? String }.joined(separator: "\n")
+    }
+
+    /// `resetsAt` is Unix seconds (milliseconds tolerated).
+    private static func date(from value: Any?) -> Date? {
+        guard let number = (value as? NSNumber)?.doubleValue, number > 0 else { return nil }
+        return Date(timeIntervalSince1970: number > 1e12 ? number / 1000 : number)
     }
 
     /// Lets Kon answer "今何時？" without spending a tool call on `date`.
@@ -129,15 +254,56 @@ actor KonClient {
         return "［現在日時: \(formatter.string(from: Date()))］\n"
     }
 
-    private func ensureProcess(mcpConfig: String?) async throws {
-        if let process, process.isRunning, processMCPConfig == mcpConfig {
+    /// Stops the reply in progress. The CLI is asked to interrupt the turn
+    /// (keeping the process and conversation); if it doesn't wrap up quickly
+    /// the process is stopped and the next request resumes the session.
+    func interrupt() {
+        guard isSending, !isInterrupting else { return }
+        isInterrupting = true
+        let request: [String: Any] = [
+            "type": "control_request",
+            "request_id": "kon_interrupt_\(UUID().uuidString)",
+            "request": ["subtype": "interrupt"]
+        ]
+        if var line = try? JSONSerialization.data(withJSONObject: request) {
+            line.append(0x0A)
+            try? stdin?.write(contentsOf: line)
+        }
+        interruptFallbackTask?.cancel()
+        interruptFallbackTask = Task { [weak self] in
+            try? await Task.sleep(for: Self.interruptGracePeriod)
+            guard !Task.isCancelled else { return }
+            await self?.stopIfStillInterrupting()
+        }
+    }
+
+    private func stopIfStillInterrupting() {
+        guard isSending, isInterrupting else { return }
+        stopProcess()
+    }
+
+    private func currentConfig() async -> ProcessConfig {
+        let mcpConfig = await KonComposioStore.shared.mcpConfigJSON()
+        var prompt = Self.systemPrompt
+        if mcpConfig != nil, let accounts = await KonComposioStore.shared.accountsPromptSummary {
+            prompt += """
+
+            - 次のサービスは複数アカウントが連携されている。composioのツールを実行するときは arguments に "account": "別名" を必ず入れる。読むだけの依頼（予定・メールの確認など）でアカウントの指定がなければ全アカウントを確認し、送信・作成・削除などで指定がなければどのアカウントか短く確認する。
+            \(accounts)
+            """
+        }
+        return ProcessConfig(mcpConfig: mcpConfig, systemPrompt: prompt)
+    }
+
+    private func ensureProcess(config: ProcessConfig) async throws {
+        if let process, process.isRunning, processConfig == config {
             return
         }
         stopProcess()
 
         let executablePath = try await resolveClaudeExecutablePath()
         // prewarm() and send() can interleave across that await; don't spawn twice.
-        if let process, process.isRunning, processMCPConfig == mcpConfig {
+        if let process, process.isRunning, processConfig == config {
             return
         }
         var arguments = [
@@ -146,14 +312,14 @@ actor KonClient {
             "--output-format", "stream-json",
             "--verbose",
             "--permission-mode", "auto",
-            "--append-system-prompt", Self.systemPrompt,
+            "--append-system-prompt", config.systemPrompt,
             // Skip the user-level MCP servers, plugins and hooks: loading them
             // cost ~5s of startup on every request (measured 8s → 3s for a
             // one-line reply). Kon gets its own MCP config when it needs one.
             "--strict-mcp-config",
             "--setting-sources", "project"
         ]
-        if let mcpConfig {
+        if let mcpConfig = config.mcpConfig {
             arguments += ["--mcp-config", mcpConfig]
         }
         if let sessionId {
@@ -188,7 +354,7 @@ actor KonClient {
         self.process = process
         self.stdin = inputPipe.fileHandleForWriting
         self.reader = reader
-        self.processMCPConfig = mcpConfig
+        self.processConfig = config
     }
 
     private func scheduleIdleShutdown() {
@@ -215,7 +381,7 @@ actor KonClient {
         process = nil
         stdin = nil
         reader = nil
-        processMCPConfig = nil
+        processConfig = nil
     }
 
     private static func actionSummaries(fromAssistantEvent event: [String: Any]) -> [String] {

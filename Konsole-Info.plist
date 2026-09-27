@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Where this build's source lives, for the 「最新のソースで更新」 button (KonUpdater). -->
+	<key>KonSourceRoot</key>
+	<string>$(SRCROOT)</string>
+	<!-- konsole://remind?... lets Kon (via `open -g`) schedule reminders in the app. -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>kanna.Konsole</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>konsole</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

@@ -247,6 +247,10 @@ private struct GeneralPane: View {
             .toggleStyle(.switch)
             .tint(SettingsPalette.accent)
 
+            WorkContextCard()
+
+            UpdateCard()
+
             SettingsCard(title: "吹き出し") {
                 SettingRow(title: "表示するディスプレイ", detail: "ディスプレイが複数あるときに吹き出しを出す場所") {
                     OverlayDisplayPicker(selection: $settings.overlayDisplay)
@@ -256,6 +260,86 @@ private struct GeneralPane: View {
                     "\(Int($0))秒"
                 }
             }
+        }
+    }
+}
+
+/// Rebuild from source and replace the installed app (KonUpdater).
+private struct UpdateCard: View {
+    private var updater = KonUpdater.shared
+
+    var body: some View {
+        SettingsCard(title: "アップデート") {
+            SettingRow(
+                title: "最新のソースで更新",
+                detail: "ソースをビルドして /Applications のKonsoleを置き換え、再起動します"
+            ) {
+                if updater.state == .building {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("ビルド中…").foregroundStyle(.secondary)
+                    }
+                } else {
+                    Button("更新") { updater.update() }
+                }
+            }
+            if let root = updater.sourceRoot {
+                Text(root.path(percentEncoded: false))
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.tertiary)
+                    .textSelection(.enabled)
+            }
+            if case .failed(let message) = updater.state {
+                HStack(alignment: .top) {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .textSelection(.enabled)
+                    Spacer()
+                    Button("ログを表示") { updater.revealLog() }
+                        .controlSize(.small)
+                }
+                .padding(.top, 6)
+            }
+        }
+    }
+}
+
+/// What Kon may know about the current work (KonContextProvider).
+private struct WorkContextCard: View {
+    @Bindable private var settings = KonSettings.shared
+    @State private var isTrusted = KonContextProvider.shared.isAccessibilityTrusted
+
+    var body: some View {
+        SettingsCard(title: "作業状況") {
+            SettingRow(title: "作業中のアプリを伝える", detail: "アプリ名・ウィンドウ名・開いているファイル・Finderの選択・ブラウザのページ") {
+                Toggle("", isOn: $settings.sharesAppContext).labelsHidden()
+            }
+            if settings.sharesAppContext {
+                HStack(spacing: 8) {
+                    if isTrusted {
+                        Label("アクセシビリティ許可済み", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    } else {
+                        Label("ウィンドウ名とファイルにはアクセシビリティの許可が必要です", systemImage: "exclamationmark.circle")
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("許可する") { KonContextProvider.shared.requestAccessibility() }
+                    }
+                }
+                .font(.caption)
+                .padding(.bottom, 6)
+            }
+            Divider()
+            SettingRow(title: "クリップボードを伝える", detail: "コピーした内容を「これ」で扱えるようにします（パスワード管理アプリのコピーは除外）") {
+                Toggle("", isOn: $settings.sharesClipboard).labelsHidden()
+            }
+        }
+        .toggleStyle(.switch)
+        .tint(SettingsPalette.accent)
+        // Granting happens in System Settings; re-check when coming back.
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            isTrusted = KonContextProvider.shared.isAccessibilityTrusted
         }
     }
 }
@@ -348,7 +432,7 @@ private struct VoicePane: View {
                 SliderRow(title: "無言で終了するまで", value: $settings.sessionSilenceTimeout, range: 1...15, step: 0.5) {
                     "\($0.formatted(.number.precision(.fractionLength(0...1))))秒"
                 }
-                Text("\(settings.pushToTalkShortcut.displayString)を押してから何も話さないと、この時間で自動的に終わります。")
+                Text("\(settings.pushToTalkShortcut.displayString)を押してから何も話さないと、この時間（最低3秒）で自動的に終わります。話し終わったあとは、この時間（最大1.6秒）黙ると文字起こしに進みます。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -385,7 +469,7 @@ private struct ShortcutsPane: View {
                     )
                 }
                 Divider()
-                SettingRow(title: "聞き取りをキャンセル", detail: "聞いている最中だけ有効です") {
+                SettingRow(title: "コンを止める", detail: "聞き取り・考え中・読み上げ中だけ有効です") {
                     ShortcutRecorder(
                         shortcut: $settings.cancelShortcut,
                         defaultShortcut: .defaultCancel,
@@ -613,7 +697,7 @@ private struct ComposioSelectedToolkitsCard: View {
                     ProgressView().controlSize(.small)
                 } else {
                     Button {
-                        Task { await store.refreshStatuses() }
+                        Task { await store.refreshStatuses(reloadProfiles: true) }
                     } label: {
                         Image(systemName: "arrow.clockwise")
                     }
@@ -623,6 +707,11 @@ private struct ComposioSelectedToolkitsCard: View {
                 }
             }
             .padding(.bottom, 8)
+
+            if store.lacksAccountPermission {
+                ComposioAccountPermissionNotice()
+                    .padding(.bottom, 8)
+            }
 
             if store.selectedToolkits.isEmpty {
                 Text("まだありません。下の一覧から追加してください。")
@@ -642,6 +731,7 @@ private struct ComposioSelectedRow: View {
     let slug: String
     private var store = KonComposioStore.shared
     @State private var isConnecting = false
+    @State private var isAddingAccount = false
 
     init(slug: String) {
         self.slug = slug
@@ -650,37 +740,68 @@ private struct ComposioSelectedRow: View {
     var body: some View {
         let toolkit = store.toolkit(for: slug)
         let status = store.statuses[slug]
-        HStack(spacing: 12) {
-            ToolkitLogo(url: toolkit?.logoURL)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(toolkit?.name ?? slug)
-                ComposioStatusLabel(status: status)
-            }
-            Spacer()
-            if status == .notConnected || status == .pending {
-                Button(status == .pending ? "もう一度接続" : "接続") {
-                    connect()
+        let accounts = store.accounts[slug] ?? []
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 12) {
+                ToolkitLogo(url: toolkit?.logoURL)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(toolkit?.name ?? slug)
+                    ComposioStatusLabel(status: status, activeAccounts: accounts.filter(\.isActive).count)
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(SettingsPalette.accent)
-                .disabled(isConnecting)
+                Spacer()
+                if status == .notConnected || status == .pending, accounts.isEmpty {
+                    Button(status == .pending ? "もう一度接続" : "接続") {
+                        connect(alias: nil)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(SettingsPalette.accent)
+                    .disabled(isConnecting)
+                } else if !accounts.isEmpty, store.canAddAccount(to: slug) {
+                    Button {
+                        isAddingAccount = true
+                    } label: {
+                        Label("アカウントを追加", systemImage: "plus")
+                    }
+                    .disabled(isConnecting)
+                    .popover(isPresented: $isAddingAccount, arrowEdge: .bottom) {
+                        ComposioAddAccountForm(
+                            hasUnnamedAccount: accounts.contains { ($0.alias ?? "").isEmpty },
+                            onCancel: { isAddingAccount = false },
+                            onConnect: { alias in
+                                isAddingAccount = false
+                                connect(alias: alias)
+                            }
+                        )
+                    }
+                }
+                Button {
+                    store.removeToolkit(slug)
+                } label: {
+                    Image(systemName: "minus.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("コンが使うサービスから外す")
             }
-            Button {
-                store.removeToolkit(slug)
-            } label: {
-                Image(systemName: "minus.circle.fill")
-                    .foregroundStyle(.secondary)
+            if !accounts.isEmpty {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(accounts.enumerated()), id: \.element.id) { index, account in
+                        ComposioAccountRow(account: account)
+                            .padding(.leading, TreeBranch.width)
+                            .background(alignment: .leading) {
+                                TreeBranch(isLast: index == accounts.count - 1)
+                            }
+                    }
+                }
             }
-            .buttonStyle(.plain)
-            .help("コンが使うサービスから外す")
         }
         .padding(.vertical, 8)
     }
 
-    private func connect() {
+    private func connect(alias: String?) {
         isConnecting = true
         Task {
-            if let url = await store.connectURL(for: slug) {
+            if let url = await store.connectURL(for: slug, alias: alias) {
                 NSWorkspace.shared.open(url)
             }
             isConnecting = false
@@ -688,19 +809,251 @@ private struct ComposioSelectedRow: View {
     }
 }
 
+/// Shown when the API key can't read connected accounts: without that the
+/// per-account list (and renaming / removing accounts) can't work.
+private struct ComposioAccountPermissionNotice: View {
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "key.fill")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("APIキーに「Connected Accounts」の権限がないため、連携中のアカウントを表示できません。")
+                    .font(.callout)
+                Text("Composioのダッシュボードでこのキーに Connected Accounts の読み取り・書き込み権限を追加するか、権限つきの新しいキーを作って貼り直してください。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Link("APIキーの設定を開く", destination: URL(string: "https://dashboard.composio.dev/~/project/settings/api-keys")!)
+                    .font(.caption)
+            }
+            .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+/// Asks for an alias before connecting another account, so Kon can tell
+/// "仕事のメール" from "個人のメール".
+private struct ComposioAddAccountForm: View {
+    let hasUnnamedAccount: Bool
+    let onCancel: () -> Void
+    let onConnect: (String) -> Void
+    @State private var alias = ""
+
+    private var trimmed: String { alias.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("アカウントを追加").font(.headline)
+            Text("コンに「仕事のメールを見て」のように呼び分けてもらうための名前です。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            TextField("別名（例: 仕事、個人）", text: $alias)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit { if !trimmed.isEmpty { onConnect(trimmed) } }
+            if hasUnnamedAccount {
+                Text("今あるアカウントにも鉛筆ボタンから別名をつけておくと呼び分けやすくなります。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Spacer()
+                Button("キャンセル", action: onCancel)
+                Button("ブラウザで接続") { onConnect(trimmed) }
+                    .buttonStyle(.borderedProminent)
+                    .tint(SettingsPalette.accent)
+                    .disabled(trimmed.isEmpty)
+            }
+        }
+        .padding(16)
+        .frame(width: 280)
+    }
+}
+
+/// The "├─ / └─" lines hanging accounts off their service, like a directory
+/// tree. The trunk sits under the center of the service logo.
+private struct TreeBranch: View {
+    let isLast: Bool
+
+    static let width: CGFloat = 32
+    private static let trunkX: CGFloat = 16
+
+    var body: some View {
+        Canvas { context, size in
+            var path = Path()
+            let midY = size.height / 2
+            path.move(to: CGPoint(x: Self.trunkX, y: 0))
+            path.addLine(to: CGPoint(x: Self.trunkX, y: isLast ? midY : size.height))
+            path.move(to: CGPoint(x: Self.trunkX, y: midY))
+            path.addLine(to: CGPoint(x: size.width - 4, y: midY))
+            context.stroke(path, with: .color(.secondary.opacity(0.45)), lineWidth: 1)
+        }
+        .frame(width: Self.width)
+    }
+}
+
+private struct ComposioAccountRow: View {
+    let account: ComposioConnectedAccount
+    private var store = KonComposioStore.shared
+    @State private var draft = ""
+    @State private var isEditing = false
+    @State private var confirmsRemoval = false
+
+    init(account: ComposioConnectedAccount) {
+        self.account = account
+    }
+
+    private var hasAlias: Bool { !(account.alias ?? "").isEmpty }
+    private var profile: ComposioAccountProfile? { store.profile(for: account) }
+
+    /// The account's own name when known, else its address, else the handle.
+    private var title: String {
+        profile?.name ?? profile?.email ?? account.handle
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            AccountAvatar(url: profile?.pictureURL, name: profile?.name ?? profile?.email)
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 6) {
+                    Text(title)
+                        .lineLimit(1)
+                    if !isEditing {
+                        aliasTag
+                    }
+                    if !account.isActive {
+                        Text("接続待ち").font(.caption).foregroundStyle(.orange)
+                    }
+                }
+                if let email = profile?.email, email != title {
+                    Text(email)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                if isEditing {
+                    HStack(spacing: 6) {
+                        TextField("別名（例: 仕事）", text: $draft)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 140)
+                            .onSubmit(save)
+                        Button("保存", action: save)
+                        Button("キャンセル") { isEditing = false }
+                    }
+                    .padding(.top, 2)
+                }
+            }
+            Spacer()
+            if !isEditing {
+                Button {
+                    draft = account.alias ?? ""
+                    isEditing = true
+                } label: {
+                    Image(systemName: "pencil")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("別名を変更")
+            }
+            Button {
+                confirmsRemoval = true
+            } label: {
+                Image(systemName: "trash")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("このアカウントの連携を解除")
+            .confirmationDialog("「\(title)」の連携を解除しますか？", isPresented: $confirmsRemoval) {
+                Button("解除", role: .destructive) {
+                    Task { await store.removeAccount(account) }
+                }
+            } message: {
+                Text("Composioからこのアカウントの接続が削除されます。")
+            }
+        }
+        .font(.callout)
+        .padding(.vertical, 5)
+    }
+
+    /// What Kon calls this account ("仕事のメール").
+    @ViewBuilder
+    private var aliasTag: some View {
+        Text(hasAlias ? account.handle : "別名なし")
+            .font(.caption2.weight(.medium))
+            .padding(.horizontal, 6)
+            .padding(.vertical, 1)
+            .foregroundStyle(hasAlias ? SettingsPalette.accent : .secondary)
+            .background(
+                (hasAlias ? SettingsPalette.accent : Color.secondary).opacity(0.12),
+                in: Capsule()
+            )
+            .help(hasAlias ? "コンに「\(account.handle)の〜」と頼むとこのアカウントを使います" : "鉛筆ボタンで別名をつけると呼び分けやすくなります（今は \(account.handle)）")
+    }
+
+    private func save() {
+        isEditing = false
+        Task { await store.renameAccount(account, to: draft) }
+    }
+}
+
+/// Google profile photo, or the account's initial while it loads / if there's none.
+private struct AccountAvatar: View {
+    let url: URL?
+    let name: String?
+
+    private static let size: CGFloat = 26
+
+    var body: some View {
+        AsyncImage(url: url) { phase in
+            if let image = phase.image {
+                image.resizable().scaledToFill()
+            } else {
+                placeholder
+            }
+        }
+        .frame(width: Self.size, height: Self.size)
+        .clipShape(Circle())
+        .overlay(Circle().strokeBorder(Color.primary.opacity(0.1)))
+    }
+
+    @ViewBuilder
+    private var placeholder: some View {
+        if let initial = name?.first {
+            Text(String(initial).uppercased())
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color.secondary.opacity(0.6))
+        } else {
+            Image(systemName: "person.crop.circle.fill")
+                .resizable()
+                .foregroundStyle(.tertiary)
+        }
+    }
+}
+
 private struct ComposioStatusLabel: View {
     let status: ComposioConnectionStatus?
+    var activeAccounts = 0
 
     var body: some View {
         switch status {
         case .connected:
-            Label("接続済み", systemImage: "checkmark.circle.fill").foregroundStyle(.green).font(.caption)
+            Label(activeAccounts > 1 ? "接続済み（\(activeAccounts)アカウント）" : "接続済み", systemImage: "checkmark.circle.fill")
+                .foregroundStyle(.green).font(.caption)
         case .noAuthRequired:
             Label("接続不要", systemImage: "checkmark.circle").foregroundStyle(.green).font(.caption)
         case .pending:
             Label("接続を完了してください", systemImage: "clock").foregroundStyle(.orange).font(.caption)
         case .notConnected:
             Label("未接続", systemImage: "xmark.circle").foregroundStyle(.secondary).font(.caption)
+        case .unknown:
+            Label("確認できませんでした", systemImage: "exclamationmark.triangle")
+                .foregroundStyle(.orange).font(.caption)
+                .help("下に表示されているエラーを確認して、更新ボタンで再確認してください")
         case nil:
             Text("確認中…").foregroundStyle(.secondary).font(.caption)
         }

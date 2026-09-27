@@ -31,6 +31,16 @@ struct KonOverlayView: View {
             .padding(.horizontal, 18)
             .padding(.vertical, 12)
             .background(.thinMaterial, in: Capsule())
+        case .transcribing:
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("文字起こし中…")
+                    .font(.system(size: 15, weight: .semibold))
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 12)
+            .background(.thinMaterial, in: Capsule())
         case .thinking:
             HStack(spacing: 8) {
                 ProgressView()
