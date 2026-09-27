@@ -145,10 +145,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.isReleasedWhenClosed = false
             window.setContentSize(NSSize(width: 780, height: 540))
             window.center()
+            // Open on the Space the user is on instead of jumping back to
+            // wherever the window was first shown.
+            window.collectionBehavior.insert(.moveToActiveSpace)
             settingsWindow = window
         }
-        NSApp.activate(ignoringOtherApps: true)
-        settingsWindow?.makeKeyAndOrderFront(nil)
+        // Run after the status menu has finished closing: activating while it
+        // is still tracking gets ignored, leaving the window behind other apps.
+        DispatchQueue.main.async { [weak self] in
+            guard let window = self?.settingsWindow else { return }
+            NSApp.activate()
+            window.makeKeyAndOrderFront(nil)
+            // macOS 14+ may decline activation for an LSUIElement app; this
+            // still puts the window on top so it is never hidden.
+            window.orderFrontRegardless()
+        }
     }
 
     // MARK: - Floating top-right overlay (voice session HUD)
@@ -171,7 +182,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func positionOverlayPanel() {
-        guard let screen = NSScreen.main else { return }
+        guard let screen = settings.overlayDisplay.screen else { return }
         let size = overlayPanel.frame.size
         // Inset from the top-right corner so the bubble doesn't hug the
         // menu bar or collide with notification banners.
@@ -185,6 +196,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showOverlay() {
+        // Re-resolve per session: displays come and go, and "mouse" follows
+        // the pointer. Not while visible, so the bubble doesn't jump mid-reply.
+        if !overlayPanel.isVisible {
+            positionOverlayPanel()
+        }
         overlayPanel.orderFrontRegardless()
     }
 

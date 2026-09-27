@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Observation
 import ServiceManagement
@@ -19,6 +20,7 @@ final class KonSettings {
         static let playsListeningSound = "playsListeningSound"
         static let pushToTalkShortcut = "pushToTalkShortcut"
         static let cancelShortcut = "cancelShortcut"
+        static let overlayDisplay = "overlayDisplay"
     }
 
     private let defaults: UserDefaults
@@ -46,6 +48,10 @@ final class KonSettings {
     }
     var playsListeningSound: Bool {
         didSet { defaults.set(playsListeningSound, forKey: Key.playsListeningSound) }
+    }
+    /// Which display the voice overlay appears on.
+    var overlayDisplay: KonOverlayDisplay {
+        didSet { defaults.set(overlayDisplay.rawValue, forKey: Key.overlayDisplay) }
     }
 
     var pushToTalkShortcut: KonShortcut {
@@ -96,6 +102,7 @@ final class KonSettings {
         sessionSilenceTimeout = defaults.double(forKey: Key.sessionSilenceTimeout)
         replyDisplaySeconds = defaults.double(forKey: Key.replyDisplaySeconds)
         playsListeningSound = defaults.bool(forKey: Key.playsListeningSound)
+        overlayDisplay = defaults.string(forKey: Key.overlayDisplay).flatMap(KonOverlayDisplay.init(rawValue:)) ?? .mouse
         pushToTalkShortcut = Self.loadShortcut(from: defaults, forKey: Key.pushToTalkShortcut) ?? .defaultPushToTalk
         cancelShortcut = Self.loadShortcut(from: defaults, forKey: Key.cancelShortcut) ?? .defaultCancel
     }
@@ -107,5 +114,53 @@ final class KonSettings {
     private static func loadShortcut(from defaults: UserDefaults, forKey key: String) -> KonShortcut? {
         guard let data = defaults.data(forKey: key) else { return nil }
         return try? JSONDecoder().decode(KonShortcut.self, from: data)
+    }
+}
+
+/// Where the voice overlay is shown when more than one display is connected.
+enum KonOverlayDisplay: Hashable {
+    /// The display the mouse pointer is on.
+    case mouse
+    /// The display with the menu bar (primary display in System Settings).
+    case primary
+    /// A specific display, by CGDirectDisplayID. Falls back to `.primary`
+    /// while that display is disconnected.
+    case display(CGDirectDisplayID)
+
+    init?(rawValue: String) {
+        switch rawValue {
+        case "mouse": self = .mouse
+        case "primary": self = .primary
+        default:
+            guard rawValue.hasPrefix("display:"),
+                  let id = UInt32(rawValue.dropFirst("display:".count)) else { return nil }
+            self = .display(id)
+        }
+    }
+
+    var rawValue: String {
+        switch self {
+        case .mouse: "mouse"
+        case .primary: "primary"
+        case .display(let id): "display:\(id)"
+        }
+    }
+
+    var screen: NSScreen? {
+        switch self {
+        case .mouse:
+            let location = NSEvent.mouseLocation
+            return NSScreen.screens.first { NSMouseInRect(location, $0.frame, false) } ?? NSScreen.screens.first
+        case .primary:
+            return NSScreen.screens.first
+        case .display(let id):
+            return NSScreen.screens.first { $0.displayID == id } ?? NSScreen.screens.first
+        }
+    }
+}
+
+extension NSScreen {
+    var displayID: CGDirectDisplayID? {
+        (deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
     }
 }
