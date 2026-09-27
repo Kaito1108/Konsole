@@ -13,8 +13,10 @@ final class ChatViewModel {
     /// Called when a spoken command is recognized, so the menu bar host
     /// can surface the overlay even before a reply is ready.
     var onActivity: (() -> Void)?
-    /// Called when a voice session starts and Kon is waiting for the command.
+    /// Called when a voice session starts; the mic may not be live yet.
     var onListeningStart: (() -> Void)?
+    /// Called once the mic actually delivers audio, i.e. Kon can hear the user.
+    var onMicLive: (() -> Void)?
     /// Called when the utterance ended and speech-to-text is running.
     var onTranscribingStart: (() -> Void)?
     /// Called when a voice session ends without a command (silence or cancel).
@@ -55,8 +57,10 @@ final class ChatViewModel {
         listener.onStateChange = { [weak self] state in
             self?.listenerState = state
             self?.updateBusy()
-            if state == .thinking {
-                self?.onTranscribingStart?()
+            switch state {
+            case .listening: self?.onMicLive?()
+            case .thinking: self?.onTranscribingStart?()
+            case .idle, .preparing: break
             }
         }
         listener.onCommand = { [weak self] text in
@@ -289,6 +293,7 @@ struct ChatView: View {
     private var statusColor: Color {
         switch viewModel.listenerState {
         case .idle: return .gray
+        case .preparing: return .yellow
         case .listening: return .green
         case .thinking: return .orange
         }
@@ -297,6 +302,7 @@ struct ChatView: View {
     private var statusText: String {
         switch viewModel.listenerState {
         case .idle: return "\(pushToTalkKeys)で声で話しかけられます"
+        case .preparing: return "マイク準備中…"
         case .listening: return "聞いています…"
         case .thinking: return "文字起こし中…"
         }

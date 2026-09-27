@@ -42,9 +42,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         chatViewModel.onListeningStart = { [weak self] in
             self?.overlayHideTask?.cancel()
-            self?.overlayViewModel.showListening()
+            self?.overlayViewModel.showPreparing()
             self?.showOverlay()
-            if self?.settings.playsListeningSound == true {
+        }
+        // Only claim to be listening once the mic actually delivers audio.
+        chatViewModel.onMicLive = { [weak self] in
+            guard let self, overlayViewModel.phase == .preparing else { return }
+            overlayViewModel.showListening()
+            if settings.playsListeningSound {
                 NSSound(named: "Tink")?.play()
             }
         }
@@ -70,7 +75,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         chatViewModel.onListeningEndedWithoutCommand = { [weak self] reason in
             guard let self else { return }
             let phase = overlayViewModel.phase
-            guard phase == .listening || phase == .transcribing else { return }
+            guard phase == .preparing || phase == .listening || phase == .transcribing else { return }
             // Say why nothing happened, rather than just vanishing.
             if let message = Self.message(for: reason) {
                 showReplyOverlay(KonReply(text: message, actions: []), isSpoken: false)
