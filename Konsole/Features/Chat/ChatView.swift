@@ -173,6 +173,7 @@ final class ChatViewModel {
         errorMessage = nil
         conversationId = UUID()
         Task { await client.resetSession() }
+        KonProfileStore.shared.learnIfNeeded(conversationEnded: true)
     }
 
     func send(_ text: String) {
@@ -194,6 +195,7 @@ final class ChatViewModel {
                 guard generation == sendGeneration else { return }
                 append(KonMessage(role: .kon, text: reply.text, actions: reply.actions))
                 onReply?(reply)
+                KonProfileStore.shared.learnIfNeeded()
                 if settings.speakReplies {
                     speak(reply.text)
                 }

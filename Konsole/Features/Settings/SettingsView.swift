@@ -29,6 +29,8 @@ struct SettingsView: View {
     private var content: some View {
         switch selection {
         case .general: GeneralPane()
+        case .persona: PersonaPane()
+        case .routines: RoutinesPane()
         case .voice: VoicePane()
         case .shortcuts: ShortcutsPane()
         case .integrations: IntegrationsPane()
@@ -38,13 +40,15 @@ struct SettingsView: View {
 }
 
 enum SettingsSection: String, CaseIterable, Identifiable {
-    case general, voice, shortcuts, integrations, history
+    case general, persona, routines, voice, shortcuts, integrations, history
 
     var id: Self { self }
 
     var title: String {
         switch self {
         case .general: "一般"
+        case .persona: "性格・学習"
+        case .routines: "定型フレーズ"
         case .voice: "音声"
         case .shortcuts: "ショートカット"
         case .integrations: "連携"
@@ -55,6 +59,8 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     var systemImage: String {
         switch self {
         case .general: "gearshape"
+        case .persona: "pawprint"
+        case .routines: "text.bubble"
         case .voice: "waveform"
         case .shortcuts: "keyboard"
         case .integrations: "puzzlepiece.extension"
@@ -373,6 +379,239 @@ private struct OverlayDisplayPicker: View {
         screens = NSScreen.screens.compactMap { screen in
             screen.displayID.map { (id: $0, name: screen.localizedName) }
         }
+    }
+}
+
+// MARK: - Persona
+
+private struct PersonaPane: View {
+    @Bindable private var settings = KonSettings.shared
+    @State private var speechClient = KonSpeechClient()
+
+    var body: some View {
+        VStack(spacing: 16) {
+            PaneHeader(title: "性格・学習", subtitle: "コンの話し方と、あなたについて覚えていることを設定します")
+            SettingsCard(title: "話し方") {
+                SettingRow(title: "あなたの呼び方", detail: "空欄なら名前では呼びません") {
+                    TextField("例: カイト", text: $settings.userCallName)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(maxWidth: 200)
+                }
+                Divider()
+                SettingRow(title: "口調") {
+                    Picker("", selection: $settings.personaTone) {
+                        ForEach(KonPersonaTone.allCases) { tone in
+                            Text(tone.title).tag(tone)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(maxWidth: 220)
+                }
+                Divider()
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("性格・対応のしかた")
+                    Text("自由に書けます。例: 皮肉っぽいけど根はやさしい / 迷っていたら選択肢を2つに絞って / 壁打ちのときは質問で返して")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    MemoEditor(text: $settings.personaNotes, minHeight: 90)
+                }
+                .padding(.vertical, 10)
+                HStack {
+                    Text("変更は次に話しかけたときから反映されます")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button {
+                        speechClient.speak(settings.personaTone.sample)
+                    } label: {
+                        Label("口調を試し聞き", systemImage: "play.fill")
+                    }
+                }
+            }
+
+            ProfileCard()
+        }
+    }
+}
+
+/// What Kon has learned about the user (KonProfileStore).
+private struct ProfileCard: View {
+    @Bindable private var settings = KonSettings.shared
+    private var store = KonProfileStore.shared
+    @State private var draft = ""
+    @State private var confirmsReset = false
+
+    var body: some View {
+        SettingsCard(title: "あなたについてのメモ") {
+            SettingRow(title: "会話から自動で学習する", detail: "話し方の癖や、だいたい何を言いたいかを会話から覚えます") {
+                Toggle("", isOn: $settings.learnsFromConversations).labelsHidden()
+            }
+            .toggleStyle(.switch)
+            .tint(SettingsPalette.accent)
+            Divider()
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text(statusText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    if store.isLearning {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+                MemoEditor(text: $draft, minHeight: 180, placeholder: "まだメモはありません。話しかけるうちに増えていきます。直接書いてもOKです。")
+                if let error = store.lastError {
+                    Text(error).font(.caption).foregroundStyle(.red)
+                }
+                HStack {
+                    Button("リセット", role: .destructive) { confirmsReset = true }
+                        .disabled(store.text.isEmpty && draft.isEmpty)
+                    Spacer()
+                    Button("今すぐ学習") { store.learnNow() }
+                        .disabled(store.isLearning || draft != store.text)
+                    Button("保存") { store.save(draft) }
+                        .buttonStyle(.borderedProminent)
+                        .tint(SettingsPalette.accent)
+                        .disabled(draft == store.text)
+                }
+                .padding(.top, 4)
+            }
+            .padding(.vertical, 10)
+            Text("コンに「〇〇って覚えておいて」と言っても追記されます。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .confirmationDialog("メモを全部消しますか？", isPresented: $confirmsReset) {
+            Button("消す", role: .destructive) { store.reset() }
+        } message: {
+            Text("これまでの会話はもう学習に使われません。")
+        }
+        .onAppear {
+            store.reload()
+            draft = store.text
+        }
+        .onChange(of: store.text) { _, newValue in draft = newValue }
+    }
+
+    private var statusText: String {
+        if store.isLearning { return "会話から学習中…" }
+        var parts: [String] = []
+        if let date = store.lastLearnedAt {
+            parts.append("最終学習: \(date.formatted(date: .abbreviated, time: .shortened))")
+        }
+        parts.append("未学習の発言: \(store.pendingMessageCount)件")
+        return parts.joined(separator: "・")
+    }
+}
+
+// MARK: - Routines
+
+private struct RoutinesPane: View {
+    @Bindable private var settings = KonSettings.shared
+
+    var body: some View {
+        VStack(spacing: 16) {
+            PaneHeader(title: "定型フレーズ", subtitle: "決まった言葉を言ったときに、コンにしてほしいことを登録します")
+            if settings.routines.isEmpty {
+                SettingsCard {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("まだ登録されていません")
+                        Text("例: 「おはよう」→「今日の日付と予定を確認して、未読の大事なメールがあれば一言で教えて。最後に今日も頑張ろうって言って」")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            ForEach(settings.routines) { routine in
+                RoutineCard(routine: binding(for: routine)) {
+                    settings.routines.removeAll { $0.id == routine.id }
+                }
+            }
+            HStack {
+                Text("言い回しが少し違っても、コンが意味で判断して実行します。変更は次に話しかけたときから反映されます。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    settings.routines.append(KonRoutine(trigger: "", instruction: ""))
+                } label: {
+                    Label("追加", systemImage: "plus")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(SettingsPalette.accent)
+            }
+        }
+    }
+
+    /// Looks the routine up by id on every access. `ForEach($settings.routines)`
+    /// hands out index-based bindings, and a text field that is still focused
+    /// reads its index after the row is deleted, crashing with out of range.
+    private func binding(for routine: KonRoutine) -> Binding<KonRoutine> {
+        Binding(
+            get: { settings.routines.first { $0.id == routine.id } ?? routine },
+            set: { newValue in
+                guard let index = settings.routines.firstIndex(where: { $0.id == routine.id }) else { return }
+                settings.routines[index] = newValue
+            }
+        )
+    }
+}
+
+private struct RoutineCard: View {
+    @Binding var routine: KonRoutine
+    let onDelete: () -> Void
+
+    var body: some View {
+        SettingsCard {
+            HStack(spacing: 10) {
+                TextField("きっかけの言葉（例: おはよう、おはー）", text: $routine.trigger)
+                    .textFieldStyle(.roundedBorder)
+                Toggle("", isOn: $routine.isEnabled)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .tint(SettingsPalette.accent)
+                Button(role: .destructive, action: onDelete) {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.borderless)
+                .help("削除")
+            }
+            Text("「、」で区切ると複数の言葉を登録できます")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.top, 4)
+                .padding(.bottom, 10)
+            Text("コンへの指示")
+                .padding(.bottom, 6)
+            MemoEditor(text: $routine.instruction, minHeight: 70, placeholder: "例: 今日の予定を確認して、最初の予定まであと何分か教えて")
+        }
+        .opacity(routine.isEnabled ? 1 : 0.6)
+    }
+}
+
+private struct MemoEditor: View {
+    @Binding var text: String
+    var minHeight: CGFloat
+    var placeholder: String?
+
+    var body: some View {
+        TextEditor(text: $text)
+            .font(.system(size: 12))
+            .scrollContentBackground(.hidden)
+            .padding(6)
+            .frame(minHeight: minHeight)
+            .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.primary.opacity(0.1)))
+            .overlay(alignment: .topLeading) {
+                if text.isEmpty, let placeholder {
+                    Text(placeholder)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 6)
+                        .allowsHitTesting(false)
+                }
+            }
     }
 }
 

@@ -107,6 +107,7 @@ actor KonClient {
     - ユーザー発言の先頭にある［作業状況］は、ユーザーが今見ているアプリ・ファイル・ページ・クリップボードの参考情報。「これ」「このファイル」「さっきコピーしたの」などの指示語はこれで解釈する。関係ないときは触れない。
     - 「25分後に教えて」「17時に〇〇って言って」のようなタイマー・リマインダーは、Bashで open -g "konsole://remind?in=秒数&text=読み上げる一言" または open -g "konsole://remind?at=UNIX秒&text=読み上げる一言" を実行して登録する。textはURLエンコードし、時刻になったらそのまま読み上げられる一言にする（例: 25分たったよ、休憩しよう）。at は date -j -f "%Y-%m-%d %H:%M" "2026-01-01 17:00" +%s のように求める。
     - 登録済みリマインダーは \(KonReminderStore.fileURL.path(percentEncoded: false)) にJSONで保存されている。取り消しは open -g "konsole://remind/cancel?id=ID"、全部なら open -g "konsole://remind/cancel?all=1"。
+    - ユーザーに「覚えておいて」と頼まれた好み・呼び方・言葉の意味などは、\(KonProfileStore.fileURL.path(percentEncoded: false)) のメモ（Markdown、なければ作る）の該当する見出しに一行で追記する。
     """
 
     private var claudeExecutablePath: String?
@@ -285,6 +286,23 @@ actor KonClient {
     private func currentConfig() async -> ProcessConfig {
         let mcpConfig = await KonComposioStore.shared.mcpConfigJSON()
         var prompt = Self.systemPrompt
+        prompt += "\n\n［コンの性格・話し方］\n" + (await KonSettings.shared.personaPrompt)
+        if let routines = await KonSettings.shared.routinesPrompt {
+            prompt += """
+
+
+            ［定型フレーズ］ユーザーの発言が次のきっかけの言葉にあたるとき（言い回しの違い・音声認識の誤変換・前後の呼びかけを含む）は、矢印の先の指示に従って対応する。きっかけの言葉が別の依頼の一部に出てくるだけのときは通常どおり対応する。
+            \(routines)
+            """
+        }
+        if let profile = KonProfileStore.readProfile() {
+            prompt += """
+
+
+            ［ユーザーについてのメモ］これまでの会話から分かったユーザーの癖や傾向。発言の意図を汲むのに使い、メモの内容を口に出して説明しない。
+            \(profile)
+            """
+        }
         if mcpConfig != nil, let accounts = await KonComposioStore.shared.accountsPromptSummary {
             prompt += """
 
@@ -466,7 +484,12 @@ actor KonClient {
         if let claudeExecutablePath {
             return claudeExecutablePath
         }
+        let path = try Self.findClaudeExecutable()
+        claudeExecutablePath = path
+        return path
+    }
 
+    nonisolated static func findClaudeExecutable() throws -> String {
         // GUI apps launched via Finder/LaunchServices get little to no PATH or
         // SHELL (unlike a Terminal session), so shelling out to "the user's
         // shell" to run `which claude` is unreliable. Check known install
@@ -480,7 +503,6 @@ actor KonClient {
         ]
 
         if let path = knownCandidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
-            claudeExecutablePath = path
             return path
         }
 
