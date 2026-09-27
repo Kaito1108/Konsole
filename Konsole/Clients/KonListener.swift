@@ -24,10 +24,18 @@ enum KonListenerError: Error, LocalizedError {
 /// via whisper. A session that hears nothing for its silence timeout ends on
 /// its own.
 final class KonListener: @unchecked Sendable {
-    private static let voiceRMSThreshold: Float = 0.015
-    private static let silenceHangoverSeconds: Double = 1.2
+    /// Voice threshold = noise floor × this, clamped to the range below. A
+    /// fixed 0.015 treated soft speech and quiet mics (AirPods) as silence,
+    /// ending sessions mid-sentence.
+    private static let voiceToNoiseRatio: Float = 3
+    private static let minVoiceRMSThreshold: Float = 0.004
+    private static let maxVoiceRMSThreshold: Float = 0.015
+    private static let initialNoiseFloor: Float = 0.003
+    /// Long enough to survive a breath or a pause to think mid-sentence.
+    private static let silenceHangoverSeconds: Double = 1.6
     private static let minUtteranceSeconds: Double = 0.35
-    private static let maxUtteranceSeconds: Double = 12.0
+    private static let maxUtteranceSeconds: Double = 30.0
+    private static let micStartupTimeoutSeconds: Double = 4.0
 
     /// Fires on the main thread with the listener's high-level state, for UI (icon/bubble) to reflect.
     var onStateChange: ((KonListenerState) -> Void)?
@@ -49,7 +57,12 @@ final class KonListener: @unchecked Sendable {
     private var utteranceSamples: [Float] = []
     private var isCapturingUtterance = false
     private var silenceSeconds: Double = 0
-    private var sessionStartedAt: CFAbsoluteTime = 0
+    private var noiseFloor: Float = initialNoiseFloor
+    /// When the mic started delivering real audio. The silence timeout counts
+    /// from here, not from the hotkey: Bluetooth mics take ~1s to come up and
+    /// only send zeros meanwhile, so a short timeout expired before the user
+    /// could be heard at all.
+    private var audioStartedAt: CFAbsoluteTime?
     private var sessionSilenceTimeout: CFAbsoluteTime = 5
     private var isClosing = false
 
@@ -68,7 +81,8 @@ final class KonListener: @unchecked Sendable {
         utteranceSamples.removeAll()
         isCapturingUtterance = false
         silenceSeconds = 0
-        sessionStartedAt = CFAbsoluteTimeGetCurrent()
+        noiseFloor = Self.initialNoiseFloor
+        audioStartedAt = nil
         sessionSilenceTimeout = silenceTimeout
         isClosing = false
 
@@ -86,6 +100,15 @@ final class KonListener: @unchecked Sendable {
         self.engine = engine
         isListening = true
         notifyState(.listening)
+
+        // If the mic never comes up (device switch, engine stopped), don't
+        // sit in "listening" forever.
+        let engineID = ObjectIdentifier(engine)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.micStartupTimeoutSeconds + silenceTimeout) { [weak self] in
+            guard let self, let current = self.engine, ObjectIdentifier(current) == engineID,
+                  self.audioStartedAt == nil else { return }
+            self.cancelSession()
+        }
     }
 
     /// Cancels the current session without transcribing anything.
@@ -111,10 +134,22 @@ final class KonListener: @unchecked Sendable {
     private func process(buffer: AVAudioPCMBuffer) {
         guard !isClosing, let converter, let samples = Self.convert(buffer, with: converter, to: targetFormat) else { return }
 
+        if audioStartedAt == nil {
+            // Still warming up: the device is sending digital silence.
+            guard samples.contains(where: { $0 != 0 }) else { return }
+            audioStartedAt = CFAbsoluteTimeGetCurrent()
+        }
+
         let rms = Self.rms(samples)
         let bufferSeconds = Double(samples.count) / targetFormat.sampleRate
 
-        if rms > Self.voiceRMSThreshold {
+        let threshold = min(max(noiseFloor * Self.voiceToNoiseRatio, Self.minVoiceRMSThreshold), Self.maxVoiceRMSThreshold)
+        if rms <= threshold {
+            // Track the room's background level from non-voice buffers only.
+            noiseFloor = noiseFloor * 0.9 + rms * 0.1
+        }
+
+        if rms > threshold {
             isCapturingUtterance = true
             silenceSeconds = 0
             utteranceSamples.append(contentsOf: samples)
@@ -125,7 +160,7 @@ final class KonListener: @unchecked Sendable {
                 finishUtterance()
                 return
             }
-        } else if CFAbsoluteTimeGetCurrent() - sessionStartedAt >= sessionSilenceTimeout {
+        } else if let audioStartedAt, CFAbsoluteTimeGetCurrent() - audioStartedAt >= sessionSilenceTimeout {
             isClosing = true
             DispatchQueue.main.async { [weak self] in self?.cancelSession() }
             return

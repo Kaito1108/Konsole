@@ -31,13 +31,14 @@ struct SettingsView: View {
         case .general: GeneralPane()
         case .voice: VoicePane()
         case .shortcuts: ShortcutsPane()
+        case .integrations: IntegrationsPane()
         case .history: HistoryPane(chatViewModel: chatViewModel)
         }
     }
 }
 
 enum SettingsSection: String, CaseIterable, Identifiable {
-    case general, voice, shortcuts, history
+    case general, voice, shortcuts, integrations, history
 
     var id: Self { self }
 
@@ -46,6 +47,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .general: "一般"
         case .voice: "音声"
         case .shortcuts: "ショートカット"
+        case .integrations: "連携"
         case .history: "履歴"
         }
     }
@@ -55,6 +57,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .general: "gearshape"
         case .voice: "waveform"
         case .shortcuts: "keyboard"
+        case .integrations: "puzzlepiece.extension"
         case .history: "clock.arrow.circlepath"
         }
     }
@@ -245,10 +248,46 @@ private struct GeneralPane: View {
             .tint(SettingsPalette.accent)
 
             SettingsCard(title: "吹き出し") {
+                SettingRow(title: "表示するディスプレイ", detail: "ディスプレイが複数あるときに吹き出しを出す場所") {
+                    OverlayDisplayPicker(selection: $settings.overlayDisplay)
+                }
+                Divider()
                 SliderRow(title: "読み終わってから閉じるまで", value: $settings.replyDisplaySeconds, range: 1...15, step: 1) {
                     "\(Int($0))秒"
                 }
             }
+        }
+    }
+}
+
+private struct OverlayDisplayPicker: View {
+    @Binding var selection: KonOverlayDisplay
+    @State private var screens: [(id: CGDirectDisplayID, name: String)] = []
+
+    var body: some View {
+        Picker("", selection: $selection) {
+            Text("マウスがあるディスプレイ").tag(KonOverlayDisplay.mouse)
+            Text("メインディスプレイ").tag(KonOverlayDisplay.primary)
+            Divider()
+            ForEach(screens, id: \.id) { screen in
+                Text(screen.name).tag(KonOverlayDisplay.display(screen.id))
+            }
+            // Keep a disconnected choice selectable instead of silently dropping it.
+            if case .display(let id) = selection, !screens.contains(where: { $0.id == id }) {
+                Text("未接続のディスプレイ").tag(selection)
+            }
+        }
+        .labelsHidden()
+        .frame(maxWidth: 240)
+        .onAppear(perform: reloadScreens)
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)) { _ in
+            reloadScreens()
+        }
+    }
+
+    private func reloadScreens() {
+        screens = NSScreen.screens.compactMap { screen in
+            screen.displayID.map { (id: $0, name: screen.localizedName) }
         }
     }
 }
@@ -306,8 +345,8 @@ private struct VoicePane: View {
             }
 
             SettingsCard(title: "聞き取り") {
-                SliderRow(title: "無言で終了するまで", value: $settings.sessionSilenceTimeout, range: 2...15, step: 1) {
-                    "\(Int($0))秒"
+                SliderRow(title: "無言で終了するまで", value: $settings.sessionSilenceTimeout, range: 1...15, step: 0.5) {
+                    "\($0.formatted(.number.precision(.fractionLength(0...1))))秒"
                 }
                 Text("\(settings.pushToTalkShortcut.displayString)を押してから何も話さないと、この時間で自動的に終わります。")
                     .font(.caption)
@@ -471,6 +510,335 @@ private struct KeyCaps: View {
                     .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.primary.opacity(0.15)))
             }
         }
+    }
+}
+
+// MARK: - Integrations
+
+private struct IntegrationsPane: View {
+    @Bindable private var store = KonComposioStore.shared
+
+    var body: some View {
+        VStack(spacing: 16) {
+            PaneHeader(title: "連携", subtitle: "Composio経由でGmailやカレンダーなどをコンから使えるようにします")
+            SettingsCard(title: "Composio") {
+                SettingRow(title: "Composioと連携する", detail: "オンにすると、選んだサービスをコンが操作できます") {
+                    Toggle("", isOn: $store.isEnabled).labelsHidden()
+                }
+                if store.isEnabled {
+                    Divider()
+                    ComposioAPIKeyRow()
+                }
+            }
+            .toggleStyle(.switch)
+            .tint(SettingsPalette.accent)
+
+            if store.isEnabled && store.hasAPIKey {
+                ComposioSelectedToolkitsCard()
+                ComposioToolkitPickerCard()
+            }
+
+            if let error = store.lastError {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .task(id: store.isEnabled && store.hasAPIKey) {
+            guard store.isEnabled && store.hasAPIKey else { return }
+            await store.loadCatalogIfNeeded()
+            await store.refreshStatuses()
+        }
+        // Coming back from the browser after OAuth: pick up the new connection.
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            guard store.isEnabled && store.hasAPIKey else { return }
+            Task { await store.refreshStatuses() }
+        }
+    }
+}
+
+private struct ComposioAPIKeyRow: View {
+    private var store = KonComposioStore.shared
+    @State private var draft = ""
+    @State private var isEditing = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            SettingRow(title: "APIキー", detail: "ダッシュボードの Project Settings > API Keys にある ak_ で始まるキー") {
+                if store.hasAPIKey && !isEditing {
+                    HStack(spacing: 8) {
+                        Label("設定済み", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                        Button("変更") { isEditing = true }
+                        Button("削除", role: .destructive) { store.removeAPIKey() }
+                    }
+                } else {
+                    HStack(spacing: 8) {
+                        SecureField("ak_...", text: $draft)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 200)
+                            .onSubmit(save)
+                        Button("保存", action: save)
+                            .disabled(draft.trimmingCharacters(in: .whitespaces).isEmpty)
+                        if isEditing {
+                            Button("キャンセル") { isEditing = false; draft = "" }
+                        }
+                    }
+                }
+            }
+            if !store.hasAPIKey {
+                Link("Composioでキーを発行する", destination: URL(string: "https://dashboard.composio.dev/~/project/settings/api-keys")!)
+                    .font(.caption)
+            }
+        }
+    }
+
+    private func save() {
+        store.saveAPIKey(draft)
+        draft = ""
+        isEditing = false
+    }
+}
+
+private struct ComposioSelectedToolkitsCard: View {
+    private var store = KonComposioStore.shared
+
+    var body: some View {
+        SettingsCard {
+            HStack {
+                Text("使うサービス").font(.headline)
+                Spacer()
+                if store.isRefreshingStatuses {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Button {
+                        Task { await store.refreshStatuses() }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .buttonStyle(.plain)
+                    .help("接続状態を更新")
+                    .disabled(store.selectedToolkits.isEmpty)
+                }
+            }
+            .padding(.bottom, 8)
+
+            if store.selectedToolkits.isEmpty {
+                Text("まだありません。下の一覧から追加してください。")
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 10)
+            } else {
+                ForEach(Array(store.selectedToolkits.enumerated()), id: \.element) { index, slug in
+                    if index > 0 { Divider() }
+                    ComposioSelectedRow(slug: slug)
+                }
+            }
+        }
+    }
+}
+
+private struct ComposioSelectedRow: View {
+    let slug: String
+    private var store = KonComposioStore.shared
+    @State private var isConnecting = false
+
+    init(slug: String) {
+        self.slug = slug
+    }
+
+    var body: some View {
+        let toolkit = store.toolkit(for: slug)
+        let status = store.statuses[slug]
+        HStack(spacing: 12) {
+            ToolkitLogo(url: toolkit?.logoURL)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(toolkit?.name ?? slug)
+                ComposioStatusLabel(status: status)
+            }
+            Spacer()
+            if status == .notConnected || status == .pending {
+                Button(status == .pending ? "もう一度接続" : "接続") {
+                    connect()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(SettingsPalette.accent)
+                .disabled(isConnecting)
+            }
+            Button {
+                store.removeToolkit(slug)
+            } label: {
+                Image(systemName: "minus.circle.fill")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("コンが使うサービスから外す")
+        }
+        .padding(.vertical, 8)
+    }
+
+    private func connect() {
+        isConnecting = true
+        Task {
+            if let url = await store.connectURL(for: slug) {
+                NSWorkspace.shared.open(url)
+            }
+            isConnecting = false
+        }
+    }
+}
+
+private struct ComposioStatusLabel: View {
+    let status: ComposioConnectionStatus?
+
+    var body: some View {
+        switch status {
+        case .connected:
+            Label("接続済み", systemImage: "checkmark.circle.fill").foregroundStyle(.green).font(.caption)
+        case .noAuthRequired:
+            Label("接続不要", systemImage: "checkmark.circle").foregroundStyle(.green).font(.caption)
+        case .pending:
+            Label("接続を完了してください", systemImage: "clock").foregroundStyle(.orange).font(.caption)
+        case .notConnected:
+            Label("未接続", systemImage: "xmark.circle").foregroundStyle(.secondary).font(.caption)
+        case nil:
+            Text("確認中…").foregroundStyle(.secondary).font(.caption)
+        }
+    }
+}
+
+private struct ComposioToolkitPickerCard: View {
+    private var store = KonComposioStore.shared
+    @State private var query = ""
+    @State private var visibleCount = Self.pageSize
+
+    private static let pageSize = 20
+
+    /// Popular toolkits first; search narrows by name, slug or description.
+    private var matches: [ComposioToolkit] {
+        let trimmed = query.trimmingCharacters(in: .whitespaces)
+        let candidates = store.catalog.filter { !store.selectedToolkits.contains($0.slug) }
+        let matching = trimmed.isEmpty ? candidates : candidates.filter {
+            $0.name.localizedCaseInsensitiveContains(trimmed)
+                || $0.slug.localizedCaseInsensitiveContains(trimmed)
+                || $0.summary.localizedCaseInsensitiveContains(trimmed)
+        }
+        return matching
+    }
+
+    var body: some View {
+        SettingsCard(title: "サービスを追加") {
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                TextField("Gmail、Slack、Notion…", text: $query)
+                    .textFieldStyle(.plain)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(SettingsPalette.contentBackground, in: RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.primary.opacity(0.1)))
+            .padding(.bottom, 8)
+
+            let matches = matches
+            let results = matches.prefix(visibleCount)
+            if store.isLoadingCatalog {
+                ProgressView()
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 20)
+            } else if matches.isEmpty {
+                Text(store.catalog.isEmpty ? "一覧を読み込めませんでした。" : "見つかりませんでした。")
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 10)
+            } else {
+                LazyVStack(spacing: 0) {
+                    ForEach(Array(results.enumerated()), id: \.element.id) { index, toolkit in
+                        if index > 0 { Divider() }
+                        ComposioPickerRow(toolkit: toolkit) {
+                            store.addToolkit(toolkit.slug)
+                        }
+                        .onAppear {
+                            // Reached the bottom: reveal the next page.
+                            if index == results.count - 1, visibleCount < matches.count {
+                                visibleCount += Self.pageSize
+                            }
+                        }
+                    }
+                }
+                Text("\(results.count) / \(matches.count)件")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.top, 8)
+            }
+        }
+        .onChange(of: query) { visibleCount = Self.pageSize }
+    }
+}
+
+private struct ComposioPickerRow: View {
+    let toolkit: ComposioToolkit
+    let onAdd: () -> Void
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: onAdd) {
+            HStack(spacing: 12) {
+                ToolkitLogo(url: toolkit.logoURL)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(toolkit.name)
+                    Text(toolkit.summary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                Image(systemName: "plus.circle.fill")
+                    .foregroundStyle(isHovered ? SettingsPalette.accent : .secondary)
+            }
+            .padding(.vertical, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovered = $0 }
+    }
+}
+
+/// Composio serves logos as SVG, which AsyncImage can't decode; NSImage can.
+private struct ToolkitLogo: View {
+    let url: URL?
+    @State private var image: NSImage?
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(nsImage: image).resizable().scaledToFit()
+            } else {
+                Image(systemName: "app.dashed").foregroundStyle(.tertiary)
+            }
+        }
+        .frame(width: 26, height: 26)
+        .padding(3)
+        .background(Color.white, in: RoundedRectangle(cornerRadius: 7))
+        .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(Color.primary.opacity(0.1)))
+        .task(id: url) {
+            image = nil
+            guard let url else { return }
+            image = await ToolkitLogoCache.shared.image(for: url)
+        }
+    }
+}
+
+@MainActor
+private final class ToolkitLogoCache {
+    static let shared = ToolkitLogoCache()
+    private var images: [URL: NSImage] = [:]
+
+    func image(for url: URL) async -> NSImage? {
+        if let cached = images[url] { return cached }
+        guard let (data, _) = try? await URLSession.shared.data(from: url),
+              let image = NSImage(data: data) else { return nil }
+        images[url] = image
+        return image
     }
 }
 

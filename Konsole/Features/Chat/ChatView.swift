@@ -34,6 +34,8 @@ final class ChatViewModel {
     private var conversationId = UUID()
 
     init() {
+        // Boot the claude CLI now so the first question doesn't pay for it.
+        Task { [client] in await client.prewarm() }
         listener.onStateChange = { [weak self] state in
             self?.listenerState = state
             self?.onListenerStateChange?(state)
@@ -63,6 +65,9 @@ final class ChatViewModel {
         speechClient.stop()
         do {
             try listener.startSession(silenceTimeout: settings.sessionSilenceTimeout)
+            // If the CLI was stopped for idleness, restart it while the user is
+            // still talking so the reply doesn't pay for the launch.
+            Task { [client] in await client.prewarm() }
             onListeningStart?()
         } catch {
             errorMessage = error.localizedDescription
