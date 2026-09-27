@@ -2,6 +2,7 @@ import Foundation
 
 enum KonOverlayPhase: Equatable {
     case hidden
+    case preparing
     case listening
     case transcribing
     case thinking
@@ -16,6 +17,10 @@ final class KonOverlayViewModel {
     /// lyrics-style auto scroll. nil = not started yet (stays on the first line).
     private(set) var readingStartedAt: Date?
     private(set) var readingDuration: TimeInterval = 0
+
+    func showPreparing() {
+        phase = .preparing
+    }
 
     func showListening() {
         phase = .listening

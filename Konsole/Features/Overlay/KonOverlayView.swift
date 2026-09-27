@@ -20,6 +20,17 @@ struct KonOverlayView: View {
         switch viewModel.phase {
         case .hidden:
             EmptyView()
+        case .preparing:
+            HStack(spacing: 8) {
+                Image(systemName: "mic")
+                    .foregroundStyle(.secondary)
+                Text("マイク準備中…")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 12)
+            .background(.thinMaterial, in: Capsule())
         case .listening:
             HStack(spacing: 8) {
                 Image(systemName: "waveform")

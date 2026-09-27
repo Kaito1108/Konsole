@@ -3,6 +3,10 @@ import AVFoundation
 
 enum KonListenerState: Equatable {
     case idle
+    /// The session started but the mic isn't delivering real audio yet
+    /// (Bluetooth mics send digital silence for ~1s while coming up).
+    case preparing
+    /// The mic is actually picking up audio.
     case listening
     case thinking
 }
@@ -130,7 +134,7 @@ final class KonListener: @unchecked Sendable {
         }
         self.engine = engine
         isListening = true
-        notifyState(.listening)
+        notifyState(.preparing)
 
         // If the mic never comes up (device switch, engine stopped), don't
         // sit in "listening" forever.
@@ -169,6 +173,7 @@ final class KonListener: @unchecked Sendable {
             // Still warming up: the device is sending digital silence.
             guard samples.contains(where: { $0 != 0 }) else { return }
             audioStartedAt = CFAbsoluteTimeGetCurrent()
+            notifyState(.listening)
         }
 
         let rms = Self.rms(samples)
