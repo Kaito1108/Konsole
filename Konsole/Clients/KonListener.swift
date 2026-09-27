@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import os
 
 enum KonListenerState: Equatable {
     case idle
@@ -66,6 +67,18 @@ final class KonListener: @unchecked Sendable {
     private static let endpointPeakRatio: Float = 0.15
     private static let maxUtteranceSeconds: Double = 30.0
     private static let micStartupTimeoutSeconds: Double = 4.0
+    /// Once audio has started, a gap this long means the tap stopped firing —
+    /// e.g. another app (Discord) grabbed the mic and switched AirPods to the
+    /// call profile, which silently stops our engine.
+    private static let audioStallSeconds: Double = 1.5
+    /// The noise floor also follows the quietest buffer of this window, so a
+    /// constant background level stuck above the voice threshold (another
+    /// app's voice processing boosting the mic) stops counting as speech.
+    private static let noiseWindowSeconds: Double = 2.0
+    /// Speech must be at least this much louder than the noise floor.
+    private static let minVoiceToNoiseRatio: Float = 1.6
+
+    private static let logger = Logger(subsystem: "Konsole", category: "listener")
 
     /// Fires on the main thread with the listener's high-level state, for UI (icon/bubble) to reflect.
     var onStateChange: ((KonListenerState) -> Void)?
@@ -98,6 +111,13 @@ final class KonListener: @unchecked Sendable {
     private var sessionSilenceTimeout: CFAbsoluteTime = 5
     private var silenceHangoverSeconds: Double = maxSilenceHangoverSeconds
     private var isClosing = false
+    /// Last time the tap delivered audio; read by the watchdog on the main thread.
+    private var lastBufferAt: CFAbsoluteTime?
+    /// Recent per-buffer levels with their durations, oldest first.
+    private var recentLevels: [(rms: Float, seconds: Double)] = []
+    private var recentLevelsSeconds: Double = 0
+    private var watchdog: Timer?
+    private var configurationObserver: NSObjectProtocol?
 
     private(set) var isListening = false
 
@@ -120,6 +140,9 @@ final class KonListener: @unchecked Sendable {
         sessionSilenceTimeout = max(silenceTimeout, Self.minPreSpeechWaitSeconds)
         silenceHangoverSeconds = min(silenceTimeout, Self.maxSilenceHangoverSeconds)
         isClosing = false
+        lastBufferAt = nil
+        recentLevels.removeAll()
+        recentLevelsSeconds = 0
 
         input.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
             self?.process(buffer: buffer)
@@ -144,6 +167,41 @@ final class KonListener: @unchecked Sendable {
                   self.audioStartedAt == nil else { return }
             self.cancelSession(reason: .micUnavailable)
         }
+
+        configurationObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
+        ) { [weak self] _ in
+            Self.logger.notice("Audio engine configuration changed mid-session")
+            self?.endInterruptedSession()
+        }
+        let sessionStartedAt = CFAbsoluteTimeGetCurrent()
+        let maxSessionSeconds = Self.micStartupTimeoutSeconds + sessionSilenceTimeout + Self.maxUtteranceSeconds + 5
+        watchdog = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self, self.isListening, !self.isClosing else { return }
+            let now = CFAbsoluteTimeGetCurrent()
+            if let lastBufferAt = self.lastBufferAt, now - lastBufferAt >= Self.audioStallSeconds {
+                Self.logger.notice("Mic stopped delivering audio mid-session")
+                self.endInterruptedSession()
+            } else if now - sessionStartedAt >= maxSessionSeconds {
+                Self.logger.notice("Voice session hit its hard time limit")
+                self.endInterruptedSession()
+            }
+        }
+    }
+
+    /// The mic went away or the session ran far too long: transcribe what was
+    /// heard so far, or give up if there's nothing. Main thread only.
+    private func endInterruptedSession() {
+        guard isListening, !isClosing else { return }
+        isClosing = true
+        // Stop the tap first so the audio thread no longer touches the buffers.
+        engine?.inputNode.removeTap(onBus: 0)
+        engine?.stop()
+        if isCapturingUtterance, !utteranceSamples.isEmpty {
+            finishUtterance()
+        } else {
+            cancelSession(reason: .micUnavailable)
+        }
     }
 
     /// Cancels the current session without transcribing anything.
@@ -156,6 +214,12 @@ final class KonListener: @unchecked Sendable {
 
     private func stopMic() {
         guard isListening else { return }
+        watchdog?.invalidate()
+        watchdog = nil
+        if let configurationObserver {
+            NotificationCenter.default.removeObserver(configurationObserver)
+            self.configurationObserver = nil
+        }
         engine?.inputNode.removeTap(onBus: 0)
         engine?.stop()
         engine?.reset()
@@ -176,10 +240,25 @@ final class KonListener: @unchecked Sendable {
             notifyState(.listening)
         }
 
+        lastBufferAt = CFAbsoluteTimeGetCurrent()
         let rms = Self.rms(samples)
         let bufferSeconds = Double(samples.count) / targetFormat.sampleRate
 
-        let threshold = min(max(noiseFloor * Self.voiceToNoiseRatio, Self.minVoiceRMSThreshold), Self.maxVoiceRMSThreshold)
+        recentLevels.append((rms, bufferSeconds))
+        recentLevelsSeconds += bufferSeconds
+        while let oldest = recentLevels.first, recentLevelsSeconds - oldest.seconds >= Self.noiseWindowSeconds {
+            recentLevels.removeFirst()
+            recentLevelsSeconds -= oldest.seconds
+        }
+        // Speech has gaps between words, so the window's quietest buffer is
+        // background noise even while someone is talking.
+        if recentLevelsSeconds >= Self.noiseWindowSeconds * 0.9,
+           let quietest = recentLevels.map(\.rms).min(), quietest > noiseFloor {
+            noiseFloor = quietest
+        }
+
+        var threshold = min(max(noiseFloor * Self.voiceToNoiseRatio, Self.minVoiceRMSThreshold), Self.maxVoiceRMSThreshold)
+        threshold = max(threshold, noiseFloor * Self.minVoiceToNoiseRatio)
         if rms <= threshold {
             // Track the room's background level from non-voice buffers only.
             noiseFloor = noiseFloor * 0.9 + rms * 0.1
