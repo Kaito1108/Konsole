@@ -21,6 +21,8 @@ final class KonSettings {
         static let pushToTalkShortcut = "pushToTalkShortcut"
         static let cancelShortcut = "cancelShortcut"
         static let overlayDisplay = "overlayDisplay"
+        static let sharesAppContext = "sharesAppContext"
+        static let sharesClipboard = "sharesClipboard"
     }
 
     private let defaults: UserDefaults
@@ -52,6 +54,15 @@ final class KonSettings {
     /// Which display the voice overlay appears on.
     var overlayDisplay: KonOverlayDisplay {
         didSet { defaults.set(overlayDisplay.rawValue, forKey: Key.overlayDisplay) }
+    }
+
+    /// Tell Kon which app / window / file / page the user is on.
+    var sharesAppContext: Bool {
+        didSet { defaults.set(sharesAppContext, forKey: Key.sharesAppContext) }
+    }
+    /// Tell Kon what's on the clipboard (secrets from password managers are skipped).
+    var sharesClipboard: Bool {
+        didSet { defaults.set(sharesClipboard, forKey: Key.sharesClipboard) }
     }
 
     var pushToTalkShortcut: KonShortcut {
@@ -94,6 +105,8 @@ final class KonSettings {
             Key.sessionSilenceTimeout: 5.0,
             Key.replyDisplaySeconds: 3.0,
             Key.playsListeningSound: true,
+            Key.sharesAppContext: true,
+            Key.sharesClipboard: true,
         ])
         speakReplies = defaults.bool(forKey: Key.speakReplies)
         voicevoxSpeakerId = defaults.integer(forKey: Key.voicevoxSpeakerId)
@@ -102,6 +115,8 @@ final class KonSettings {
         sessionSilenceTimeout = defaults.double(forKey: Key.sessionSilenceTimeout)
         replyDisplaySeconds = defaults.double(forKey: Key.replyDisplaySeconds)
         playsListeningSound = defaults.bool(forKey: Key.playsListeningSound)
+        sharesAppContext = defaults.bool(forKey: Key.sharesAppContext)
+        sharesClipboard = defaults.bool(forKey: Key.sharesClipboard)
         overlayDisplay = defaults.string(forKey: Key.overlayDisplay).flatMap(KonOverlayDisplay.init(rawValue:)) ?? .mouse
         pushToTalkShortcut = Self.loadShortcut(from: defaults, forKey: Key.pushToTalkShortcut) ?? .defaultPushToTalk
         cancelShortcut = Self.loadShortcut(from: defaults, forKey: Key.cancelShortcut) ?? .defaultCancel

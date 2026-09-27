@@ -7,6 +7,23 @@ enum KonListenerState: Equatable {
     case thinking
 }
 
+/// Why a voice session ended without a command, so the user can be told
+/// instead of the bubble silently disappearing.
+enum KonListenEndReason: Equatable {
+    /// ⌥Space again / Escape: the user meant it, nothing to say.
+    case cancelled
+    /// Nothing loud enough was heard before the wait ran out.
+    case noSpeech
+    /// The mic never delivered audio (device switch, Bluetooth hiccup).
+    case micUnavailable
+    /// Only a blip (a cough, a click) was heard.
+    case tooShort
+    /// Speech was heard but whisper made nothing of it.
+    case notUnderstood
+    /// Transcription itself failed (e.g. missing model).
+    case failed
+}
+
 enum KonListenerError: Error, LocalizedError {
     case converterUnavailable
 
@@ -31,9 +48,18 @@ final class KonListener: @unchecked Sendable {
     private static let minVoiceRMSThreshold: Float = 0.004
     private static let maxVoiceRMSThreshold: Float = 0.015
     private static let initialNoiseFloor: Float = 0.003
-    /// Long enough to survive a breath or a pause to think mid-sentence.
-    private static let silenceHangoverSeconds: Double = 1.6
+    /// Upper bound on the pause that ends an utterance: long enough to survive
+    /// a breath mid-sentence. A shorter session silence timeout wins, so a
+    /// 1s setting ends the utterance after 1s of silence too.
+    private static let maxSilenceHangoverSeconds: Double = 1.6
     private static let minUtteranceSeconds: Double = 0.35
+    /// However short the silence setting, give the user this long to start
+    /// talking after the hotkey; 1s ended sessions before the first word.
+    private static let minPreSpeechWaitSeconds: Double = 3
+    /// While capturing, a buffer this far below the utterance's loudest part
+    /// counts as silence even if it's above the noise-based threshold. Keeps
+    /// a noisy room (fan, AirPods hiss) from holding the session open.
+    private static let endpointPeakRatio: Float = 0.15
     private static let maxUtteranceSeconds: Double = 30.0
     private static let micStartupTimeoutSeconds: Double = 4.0
 
@@ -42,7 +68,7 @@ final class KonListener: @unchecked Sendable {
     /// Fires on the main thread with the transcribed command.
     var onCommand: ((String) -> Void)?
     /// Fires on the main thread when a session ends without a command (silence, cancel, empty transcript).
-    var onSessionEndedWithoutCommand: (() -> Void)?
+    var onSessionEndedWithoutCommand: ((KonListenEndReason) -> Void)?
     /// Fires on the main thread when local transcription fails (e.g. missing whisper model).
     var onError: ((Error) -> Void)?
 
@@ -57,6 +83,8 @@ final class KonListener: @unchecked Sendable {
     private var utteranceSamples: [Float] = []
     private var isCapturingUtterance = false
     private var silenceSeconds: Double = 0
+    /// Smoothed loudest level of the current utterance.
+    private var utterancePeak: Float = 0
     private var noiseFloor: Float = initialNoiseFloor
     /// When the mic started delivering real audio. The silence timeout counts
     /// from here, not from the hotkey: Bluetooth mics take ~1s to come up and
@@ -64,6 +92,7 @@ final class KonListener: @unchecked Sendable {
     /// could be heard at all.
     private var audioStartedAt: CFAbsoluteTime?
     private var sessionSilenceTimeout: CFAbsoluteTime = 5
+    private var silenceHangoverSeconds: Double = maxSilenceHangoverSeconds
     private var isClosing = false
 
     private(set) var isListening = false
@@ -81,9 +110,11 @@ final class KonListener: @unchecked Sendable {
         utteranceSamples.removeAll()
         isCapturingUtterance = false
         silenceSeconds = 0
+        utterancePeak = 0
         noiseFloor = Self.initialNoiseFloor
         audioStartedAt = nil
-        sessionSilenceTimeout = silenceTimeout
+        sessionSilenceTimeout = max(silenceTimeout, Self.minPreSpeechWaitSeconds)
+        silenceHangoverSeconds = min(silenceTimeout, Self.maxSilenceHangoverSeconds)
         isClosing = false
 
         input.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
@@ -104,19 +135,19 @@ final class KonListener: @unchecked Sendable {
         // If the mic never comes up (device switch, engine stopped), don't
         // sit in "listening" forever.
         let engineID = ObjectIdentifier(engine)
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.micStartupTimeoutSeconds + silenceTimeout) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.micStartupTimeoutSeconds + sessionSilenceTimeout) { [weak self] in
             guard let self, let current = self.engine, ObjectIdentifier(current) == engineID,
                   self.audioStartedAt == nil else { return }
-            self.cancelSession()
+            self.cancelSession(reason: .micUnavailable)
         }
     }
 
     /// Cancels the current session without transcribing anything.
-    func cancelSession() {
+    func cancelSession(reason: KonListenEndReason = .cancelled) {
         guard isListening else { return }
         stopMic()
         notifyState(.idle)
-        notifySessionEndedWithoutCommand()
+        notifySessionEndedWithoutCommand(reason)
     }
 
     private func stopMic() {
@@ -148,21 +179,26 @@ final class KonListener: @unchecked Sendable {
             // Track the room's background level from non-voice buffers only.
             noiseFloor = noiseFloor * 0.9 + rms * 0.1
         }
+        // Once someone is talking, "silence" is also relative to how loud they
+        // were: background noise stuck above the absolute threshold otherwise
+        // never counts as silence and the session never ends.
+        let endpointThreshold = isCapturingUtterance ? max(threshold, utterancePeak * Self.endpointPeakRatio) : threshold
 
-        if rms > threshold {
+        if rms > endpointThreshold {
             isCapturingUtterance = true
             silenceSeconds = 0
+            utterancePeak = max(rms, utterancePeak * 0.98)
             utteranceSamples.append(contentsOf: samples)
         } else if isCapturingUtterance {
             silenceSeconds += bufferSeconds
             utteranceSamples.append(contentsOf: samples)
-            if silenceSeconds >= Self.silenceHangoverSeconds {
+            if silenceSeconds >= silenceHangoverSeconds {
                 finishUtterance()
                 return
             }
         } else if let audioStartedAt, CFAbsoluteTimeGetCurrent() - audioStartedAt >= sessionSilenceTimeout {
             isClosing = true
-            DispatchQueue.main.async { [weak self] in self?.cancelSession() }
+            DispatchQueue.main.async { [weak self] in self?.cancelSession(reason: .noSpeech) }
             return
         }
 
@@ -179,7 +215,7 @@ final class KonListener: @unchecked Sendable {
 
         let duration = Double(samples.count) / targetFormat.sampleRate
         guard duration >= Self.minUtteranceSeconds else {
-            DispatchQueue.main.async { [weak self] in self?.cancelSession() }
+            DispatchQueue.main.async { [weak self] in self?.cancelSession(reason: .tooShort) }
             return
         }
 
@@ -197,12 +233,12 @@ final class KonListener: @unchecked Sendable {
                 text = try await KonWhisperClient.shared.transcribe(samples: samples)
             } catch {
                 self.notifyError(error)
-                self.notifySessionEndedWithoutCommand()
+                self.notifySessionEndedWithoutCommand(.failed)
                 return
             }
             let command = text.trimmingCharacters(in: .whitespacesAndNewlines)
             if command.isEmpty {
-                self.notifySessionEndedWithoutCommand()
+                self.notifySessionEndedWithoutCommand(.notUnderstood)
             } else {
                 self.notifyCommand(command)
             }
@@ -217,8 +253,8 @@ final class KonListener: @unchecked Sendable {
         DispatchQueue.main.async { [onCommand] in onCommand?(text) }
     }
 
-    private func notifySessionEndedWithoutCommand() {
-        DispatchQueue.main.async { [onSessionEndedWithoutCommand] in onSessionEndedWithoutCommand?() }
+    private func notifySessionEndedWithoutCommand(_ reason: KonListenEndReason) {
+        DispatchQueue.main.async { [onSessionEndedWithoutCommand] in onSessionEndedWithoutCommand?(reason) }
     }
 
     private func notifyError(_ error: Error) {

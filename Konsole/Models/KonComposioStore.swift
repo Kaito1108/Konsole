@@ -16,6 +16,7 @@ final class KonComposioStore {
         static let userId = "composioUserId"
         static let session = "composioSession"
         static let sessionSignature = "composioSessionSignature"
+        static let accountProfiles = "composioAccountProfiles"
     }
 
     private let defaults: UserDefaults
@@ -28,7 +29,7 @@ final class KonComposioStore {
         didSet { defaults.set(selectedToolkits, forKey: Key.selectedToolkits) }
     }
     /// Composio's per-user scope for connected accounts. Kon is single-user,
-    /// so one fixed id is enough.
+    /// so one fixed id is enough; several Gmail accounts etc. all live under it.
     var userId: String {
         didSet { defaults.set(userId, forKey: Key.userId) }
     }
@@ -37,7 +38,17 @@ final class KonComposioStore {
     private(set) var catalog: [ComposioToolkit] = []
     private(set) var isLoadingCatalog = false
     private(set) var statuses: [String: ComposioConnectionStatus] = [:]
+    /// Connected accounts per toolkit slug, oldest first.
+    private(set) var accounts: [String: [ComposioConnectedAccount]] = [:]
+    /// Owner of each connected account (by account id), for Google accounts.
+    /// Cached across launches; looked up once per account.
+    private(set) var profiles: [String: ComposioAccountProfile] = [:] {
+        didSet { defaults.set(try? JSONEncoder().encode(profiles), forKey: Key.accountProfiles) }
+    }
     private(set) var isRefreshingStatuses = false
+    /// The API key is scoped without "connected_accounts" access, so accounts
+    /// can't be listed, renamed or removed (connecting still works).
+    private(set) var lacksAccountPermission = false
     var lastError: String?
 
     private var session: ComposioSession?
@@ -54,6 +65,10 @@ final class KonComposioStore {
             session = try? JSONDecoder().decode(ComposioSession.self, from: data)
         }
         sessionSignature = defaults.string(forKey: Key.sessionSignature)
+        if let data = defaults.data(forKey: Key.accountProfiles),
+           let profiles = try? JSONDecoder().decode([String: ComposioAccountProfile].self, from: data) {
+            self.profiles = profiles
+        }
     }
 
     var isReady: Bool { isEnabled && hasAPIKey && !selectedToolkits.isEmpty }
@@ -76,6 +91,8 @@ final class KonComposioStore {
         invalidateSession()
         catalog = []
         statuses = [:]
+        accounts = [:]
+        profiles = [:]
     }
 
     private var client: KonComposioClient? {
@@ -98,6 +115,7 @@ final class KonComposioStore {
     func removeToolkit(_ slug: String) {
         selectedToolkits.removeAll { $0 == slug }
         statuses[slug] = nil
+        accounts[slug] = nil
         invalidateSession()
     }
 
@@ -115,29 +133,145 @@ final class KonComposioStore {
 
     // MARK: - Connections
 
-    func refreshStatuses() async {
+    /// Re-checks every selected toolkit. The account list and the session's
+    /// view are fetched independently, so one failing request can't leave a
+    /// toolkit stuck at "確認中"; every toolkit ends up with some status.
+    /// `reloadProfiles` also re-reads the owner of each Google account.
+    func refreshStatuses(reloadProfiles: Bool = false) async {
         guard hasAPIKey, !selectedToolkits.isEmpty, let client else { return }
         isRefreshingStatuses = true
         defer { isRefreshingStatuses = false }
+        let toolkits = selectedToolkits
+
+        async let connected = client.connectedAccounts(userId: userId, toolkits: toolkits)
+        var sessionStatuses: [String: ComposioConnectionStatus]?
+        var errors: [String] = []
         do {
             let session = try await ensureSession(client: client)
-            statuses = try await client.connectionStatuses(sessionId: session.id, toolkits: selectedToolkits)
-            lastError = nil
+            sessionStatuses = try await client.connectionStatuses(sessionId: session.id, toolkits: toolkits)
+        } catch {
+            errors.append(error.localizedDescription)
+        }
+        var fetchedAccounts: [ComposioConnectedAccount]?
+        do {
+            fetchedAccounts = try await connected
+            lacksAccountPermission = false
+        } catch KonComposioError.api(status: 403, _) {
+            // Explained by a dedicated notice in the settings, not as an error.
+            lacksAccountPermission = true
+        } catch {
+            errors.append(error.localizedDescription)
+        }
+
+        if let fetchedAccounts {
+            // Abandoned OAuth attempts linger as INITIATED; only show accounts
+            // that are usable or still need finishing.
+            let visible = fetchedAccounts.filter { $0.isActive || $0.status.uppercased() == "INITIATED" }
+            accounts = Dictionary(grouping: visible, by: \.toolkitSlug)
+            let ids = Set(visible.map(\.id))
+            profiles = profiles.filter { ids.contains($0.key) }
+        }
+
+        var statuses: [String: ComposioConnectionStatus] = [:]
+        for slug in toolkits {
+            let list = accounts[slug] ?? []
+            let fromSession = sessionStatuses?[slug]
+            if list.contains(where: \.isActive) {
+                statuses[slug] = .connected
+            } else if fromSession == .noAuthRequired {
+                statuses[slug] = .noAuthRequired
+            } else if !list.isEmpty {
+                statuses[slug] = .pending
+            } else if let fromSession {
+                // The account list is authoritative; the session may still
+                // point at an account that has since been removed.
+                statuses[slug] = fetchedAccounts == nil ? fromSession : (fromSession == .connected ? .notConnected : fromSession)
+            } else if fetchedAccounts != nil || sessionStatuses != nil {
+                statuses[slug] = .notConnected
+            } else {
+                statuses[slug] = self.statuses[slug] ?? .unknown
+            }
+        }
+        self.statuses = statuses
+        lastError = errors.first
+        errors.forEach { print("[Composio] refresh failed — \($0)") }
+
+        await loadProfiles(reload: reloadProfiles, client: client)
+    }
+
+    private func loadProfiles(reload: Bool, client: KonComposioClient) async {
+        let targets = accounts.values.joined().filter {
+            $0.isActive && KonComposioClient.isGoogleToolkit($0.toolkitSlug) && (reload || profiles[$0.id] == nil)
+        }
+        guard !targets.isEmpty else { return }
+        await withTaskGroup(of: (String, ComposioAccountProfile?).self) { group in
+            for account in targets {
+                group.addTask {
+                    (account.id, await client.googleProfile(accountId: account.id, toolkit: account.toolkitSlug))
+                }
+            }
+            for await (id, profile) in group {
+                if let profile { profiles[id] = profile }
+            }
+        }
+    }
+
+    func profile(for account: ComposioConnectedAccount) -> ComposioAccountProfile? {
+        profiles[account.id]
+    }
+
+    /// Returns the browser URL that finishes connecting `slug` to Composio.
+    /// Calling it for an already connected toolkit adds another account.
+    func connectURL(for slug: String, alias: String? = nil) async -> URL? {
+        guard let client else { return nil }
+        let alias = alias?.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            let session = try await ensureSession(client: client)
+            return try await client.connectURL(sessionId: session.id, toolkit: slug, alias: alias)
+        } catch {
+            lastError = error.localizedDescription
+            return nil
+        }
+    }
+
+    func canAddAccount(to slug: String) -> Bool {
+        (accounts[slug]?.count ?? 0) < KonComposioClient.maxAccountsPerToolkit
+    }
+
+    func renameAccount(_ account: ComposioConnectedAccount, to alias: String) async {
+        let alias = alias.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let client, alias != (account.alias ?? "") else { return }
+        do {
+            try await client.setAlias(alias, accountId: account.id)
+            await refreshStatuses()
         } catch {
             lastError = error.localizedDescription
         }
     }
 
-    /// Returns the browser URL that finishes connecting `slug` to Composio.
-    func connectURL(for slug: String) async -> URL? {
-        guard let client else { return nil }
+    func removeAccount(_ account: ComposioConnectedAccount) async {
+        guard let client else { return }
         do {
-            let session = try await ensureSession(client: client)
-            return try await client.connectURL(sessionId: session.id, toolkit: slug)
+            try await client.deleteAccount(account.id)
+            await refreshStatuses()
         } catch {
             lastError = error.localizedDescription
-            return nil
         }
+    }
+
+    /// Tells Kon which accounts exist, so "仕事のメール" maps to the right
+    /// `account` argument. Nil when no toolkit has more than one account.
+    var accountsPromptSummary: String? {
+        let lines = selectedToolkits.compactMap { slug -> String? in
+            let active = accounts[slug]?.filter(\.isActive) ?? []
+            guard active.count > 1 else { return nil }
+            let name = toolkit(for: slug)?.name ?? slug
+            let described = active.map { account in
+                profiles[account.id]?.email.map { "\(account.handle)（\($0)）" } ?? account.handle
+            }
+            return "- \(name): \(described.joined(separator: "、"))"
+        }
+        return lines.isEmpty ? nil : lines.joined(separator: "\n")
     }
 
     // MARK: - Session / MCP
@@ -181,7 +315,8 @@ final class KonComposioStore {
     }
 
     private var currentSignature: String {
-        "\(userId)|\(selectedToolkits.sorted().joined(separator: ","))"
+        // "multi": sessions created before multi-account support must be replaced.
+        "\(userId)|multi|\(selectedToolkits.sorted().joined(separator: ","))"
     }
 
     private func invalidateSession() {

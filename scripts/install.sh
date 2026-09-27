@@ -1,11 +1,13 @@
 #!/bin/sh
 # Builds Konsole in Release and installs it to /Applications, so it can be
 # launched from Spotlight / Launchpad / login items without Xcode.
+# Also run by the app's 「最新のソースで更新」 button.
 set -eu
 
 cd "$(dirname "$0")/.."
-BUILD_DIR="$(mktemp -d)"
-trap 'rm -rf "$BUILD_DIR"' EXIT
+# Kept between runs so updates are incremental builds, not full rebuilds.
+BUILD_DIR="${KONSOLE_BUILD_DIR:-$HOME/Library/Caches/Konsole/Build}"
+mkdir -p "$BUILD_DIR"
 
 echo "Building Konsole (Release)..."
 xcodebuild -project Konsole.xcodeproj -scheme Konsole -configuration Release \
