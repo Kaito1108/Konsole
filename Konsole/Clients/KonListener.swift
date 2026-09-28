@@ -77,6 +77,12 @@ final class KonListener: @unchecked Sendable {
     private static let noiseWindowSeconds: Double = 2.0
     /// Speech must be at least this much louder than the noise floor.
     private static let minVoiceToNoiseRatio: Float = 1.6
+    /// Hard ceiling on the noise floor. Without it `minVoiceToNoiseRatio`
+    /// lifts the voice threshold past `maxVoiceRMSThreshold`, and once the
+    /// threshold sits above the user's own voice every buffer counts as
+    /// silence: the session ends mid-sentence, or times out as "no speech"
+    /// while the user is still talking.
+    private static let maxNoiseFloor: Float = maxVoiceRMSThreshold / voiceToNoiseRatio
 
     private static let logger = Logger(subsystem: "Konsole", category: "listener")
 
@@ -251,17 +257,21 @@ final class KonListener: @unchecked Sendable {
             recentLevelsSeconds -= oldest.seconds
         }
         // Speech has gaps between words, so the window's quietest buffer is
-        // background noise even while someone is talking.
-        if recentLevelsSeconds >= Self.noiseWindowSeconds * 0.9,
+        // background noise — but only while nobody is talking. A sentence
+        // said without a real pause has no quiet buffer to find, so mid
+        // utterance this ratcheted the floor up to the user's own voice and
+        // cut them off; leave the floor alone once capture has started.
+        if !isCapturingUtterance,
+           recentLevelsSeconds >= Self.noiseWindowSeconds * 0.9,
            let quietest = recentLevels.map(\.rms).min(), quietest > noiseFloor {
-            noiseFloor = quietest
+            noiseFloor = min(quietest, Self.maxNoiseFloor)
         }
 
         var threshold = min(max(noiseFloor * Self.voiceToNoiseRatio, Self.minVoiceRMSThreshold), Self.maxVoiceRMSThreshold)
         threshold = max(threshold, noiseFloor * Self.minVoiceToNoiseRatio)
         if rms <= threshold {
             // Track the room's background level from non-voice buffers only.
-            noiseFloor = noiseFloor * 0.9 + rms * 0.1
+            noiseFloor = min(noiseFloor * 0.9 + rms * 0.1, Self.maxNoiseFloor)
         }
         // Once someone is talking, "silence" is also relative to how loud they
         // were: background noise stuck above the absolute threshold otherwise

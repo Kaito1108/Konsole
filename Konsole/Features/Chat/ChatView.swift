@@ -58,6 +58,10 @@ final class ChatViewModel {
     private var wasBusy = false
     /// Keep the mic open after Kon answers (連続会話), until silence or Escape.
     private var isContinuing = false
+    /// How many times in a row the mic was reopened because a turn was heard
+    /// but not understood. Reset as soon as a command comes through.
+    private var continuousRetries = 0
+    private static let maxContinuousRetries = 2
     /// The assistant message being streamed, and how much of it has been
     /// handed to the speech queue.
     private var streamSegmentText = ""
@@ -83,18 +87,32 @@ final class ChatViewModel {
             }
         }
         listener.onCommand = { [weak self] text in
+            self?.continuousRetries = 0
             self?.onActivity?()
             self?.send(text)
         }
         listener.onSessionEndedWithoutCommand = { [weak self] reason in
             guard let self else { return }
-            // In a continuous conversation, silence just means the user is done
-            // talking; closing the bubble quietly beats "何も聞こえなかったよ".
             let wasContinuing = isContinuing
             isContinuing = false
-            if wasContinuing, reason == .noSpeech || reason == .tooShort {
-                onCancel?()
-                return
+            if wasContinuing {
+                // A blip or an empty transcript isn't the user going quiet:
+                // they did say something and it didn't survive the VAD or
+                // whisper. Reopening the mic beats ending the conversation
+                // on someone who is still talking.
+                if reason == .tooShort || reason == .notUnderstood,
+                   continuousRetries < Self.maxContinuousRetries {
+                    continuousRetries += 1
+                    isContinuing = true
+                    resumeContinuousListeningIfNeeded()
+                    return
+                }
+                // Real silence: the user is done talking; closing the bubble
+                // quietly beats "何も聞こえなかったよ".
+                if reason == .noSpeech || reason == .tooShort {
+                    onCancel?()
+                    return
+                }
             }
             onListeningEndedWithoutCommand?(reason)
         }
@@ -124,6 +142,7 @@ final class ChatViewModel {
         do {
             try listener.startSession(silenceTimeout: settings.sessionSilenceTimeout)
             isContinuing = settings.continuesConversation
+            continuousRetries = 0
             // If the CLI was stopped for idleness, restart it while the user is
             // still talking so the reply doesn't pay for the launch.
             Task { [client] in await client.prewarm() }
