@@ -14,6 +14,18 @@ final class KonSpeechClient {
     private let synthesizer = AVSpeechSynthesizer()
     private var audioPlayer: AVAudioPlayer?
     private let playbackObserver = PlaybackObserver()
+    private var playbackContinuation: CheckedContinuation<Void, Never>?
+
+    /// Bumped by `stop()` and by each new stream, so chunks of an abandoned
+    /// reply never reach the speaker.
+    private var streamGeneration = 0
+    /// Sentences of the reply being streamed, synthesized as soon as they
+    /// arrive (concurrently) but played strictly in order.
+    private var streamChunks: [(text: String, audio: Task<Data?, Never>)] = []
+    private var isStreamClosed = true
+    private var isStreamPlaying = false
+    private var streamOnStart: ((TimeInterval) -> Void)?
+    private var streamOnFinish: (() -> Void)?
 
     init() {
         synthesizer.delegate = playbackObserver
@@ -36,9 +48,97 @@ final class KonSpeechClient {
     }
 
     func stop() {
+        streamGeneration += 1
+        for chunk in streamChunks { chunk.audio.cancel() }
+        streamChunks.removeAll()
+        isStreamClosed = true
+        streamOnStart = nil
+        streamOnFinish = nil
         playbackObserver.onFinish = nil
         synthesizer.stopSpeaking(at: .immediate)
         audioPlayer?.stop()
+        resumePlayback()
+    }
+
+    // MARK: - Streaming
+
+    /// Reads a reply that is still being written: sentences are handed over with
+    /// `appendStream` as they arrive and played back to back.
+    /// - Parameters:
+    ///   - onStart: Called when the first chunk starts playing, with its duration.
+    ///   - onFinish: Called once every chunk has played and the stream is closed.
+    func startStream(onStart: @escaping (TimeInterval) -> Void = { _ in }, onFinish: @escaping () -> Void = {}) {
+        stop()
+        isStreamClosed = false
+        streamOnStart = onStart
+        streamOnFinish = onFinish
+    }
+
+    func appendStream(_ text: String) {
+        let sentence = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !sentence.isEmpty, !isStreamClosed else { return }
+        let generation = streamGeneration
+        let audio = Task { [weak self] () -> Data? in
+            guard let self, generation == streamGeneration else { return nil }
+            return try? await synthesizeWithVoicevox(sentence)
+        }
+        streamChunks.append((sentence, audio))
+        playStreamIfNeeded(generation: generation)
+    }
+
+    /// No more text is coming; `onFinish` fires once the queue has drained.
+    func endStream() {
+        guard !isStreamClosed else { return }
+        isStreamClosed = true
+        if !isStreamPlaying {
+            finishStream(generation: streamGeneration)
+        }
+    }
+
+    /// Whether a streamed reply is still being spoken (or waiting for more text).
+    var isStreaming: Bool { !isStreamClosed || isStreamPlaying }
+
+    private func playStreamIfNeeded(generation: Int) {
+        guard !isStreamPlaying else { return }
+        isStreamPlaying = true
+        Task { [weak self] in
+            guard let self else { return }
+            var isFirstChunk = true
+            while generation == streamGeneration {
+                guard !streamChunks.isEmpty else {
+                    if isStreamClosed { break }
+                    // Waiting for the model to finish the next sentence.
+                    try? await Task.sleep(for: .milliseconds(60))
+                    continue
+                }
+                let chunk = streamChunks.removeFirst()
+                let audio = await chunk.audio.value
+                guard generation == streamGeneration else { break }
+                let onStart = streamOnStart
+                let reportStart: (TimeInterval) -> Void = { duration in
+                    guard isFirstChunk else { return }
+                    isFirstChunk = false
+                    onStart?(duration)
+                }
+                if let audio {
+                    await playAndWait(audio, onStart: reportStart)
+                } else {
+                    await speakWithSystemVoiceAndWait(chunk.text, onStart: reportStart)
+                }
+            }
+            isStreamPlaying = false
+            if isStreamClosed {
+                finishStream(generation: generation)
+            }
+        }
+    }
+
+    private func finishStream(generation: Int) {
+        guard generation == streamGeneration, streamChunks.isEmpty else { return }
+        let handler = streamOnFinish
+        streamOnFinish = nil
+        streamOnStart = nil
+        handler?()
     }
 
     // MARK: - VOICEVOX
@@ -102,6 +202,33 @@ final class KonSpeechClient {
         guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
             throw URLError(.badServerResponse)
         }
+    }
+
+    /// Plays one chunk and returns when it has finished (or was stopped).
+    private func playAndWait(_ audioData: Data, onStart: (TimeInterval) -> Void) async {
+        audioPlayer?.stop()
+        guard let player = try? AVAudioPlayer(data: audioData) else { return }
+        player.delegate = playbackObserver
+        audioPlayer = player
+        await withCheckedContinuation { continuation in
+            playbackContinuation = continuation
+            playbackObserver.onFinish = { [weak self] in self?.resumePlayback() }
+            player.play()
+            onStart(player.duration)
+        }
+    }
+
+    private func speakWithSystemVoiceAndWait(_ text: String, onStart: (TimeInterval) -> Void) async {
+        await withCheckedContinuation { continuation in
+            playbackContinuation = continuation
+            speakWithSystemVoice(text, onStart: onStart) { [weak self] in self?.resumePlayback() }
+        }
+    }
+
+    private func resumePlayback() {
+        guard let continuation = playbackContinuation else { return }
+        playbackContinuation = nil
+        continuation.resume()
     }
 
     private func play(_ audioData: Data, onStart: (TimeInterval) -> Void, onFinish: @escaping () -> Void) {

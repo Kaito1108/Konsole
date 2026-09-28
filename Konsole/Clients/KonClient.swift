@@ -90,7 +90,27 @@ enum KonClientError: Error, LocalizedError {
 struct KonReply {
     let text: String
     let actions: [String]
+    /// Which model answered, when model routing is on ("Haiku 4.5"); nil hides it.
+    var modelLabel: String? = nil
+    /// The text was already shown/read as it arrived, so the UI shouldn't start over.
+    var wasStreamed: Bool = false
 }
+
+/// A tool call the CLI is asking permission for, in words the user can judge.
+struct KonPermissionRequest: Sendable {
+    let toolName: String
+    /// One line, e.g. 「ファイルを作成しました: memo.md」 rephrased as a question.
+    let summary: String
+    /// The concrete argument (path, command), if there is one worth showing.
+    let detail: String?
+}
+
+/// Reply text as it arrives. `text` is everything of the current message so
+/// far (a replacement, not an append); `isNewSegment` marks the start of a new
+/// assistant message — the CLI may talk before and after using a tool.
+typealias KonStreamHandler = @MainActor @Sendable (_ text: String, _ isNewSegment: Bool) -> Void
+/// Answers a permission request: true = allow once, false = deny.
+typealias KonPermissionHandler = @MainActor @Sendable (KonPermissionRequest) async -> Bool
 
 /// Drives Claude Code via the `claude` CLI subprocess (`-p --output-format stream-json`)
 /// instead of the Python/TypeScript-only Agent SDK.
@@ -107,11 +127,14 @@ actor KonClient {
     - ユーザー発言の先頭にある［作業状況］は、ユーザーが今見ているアプリ・ファイル・ページ・クリップボードの参考情報。「これ」「このファイル」「さっきコピーしたの」などの指示語はこれで解釈する。関係ないときは触れない。
     - 「25分後に教えて」「17時に〇〇って言って」のようなタイマー・リマインダーは、Bashで open -g "konsole://remind?in=秒数&text=読み上げる一言" または open -g "konsole://remind?at=UNIX秒&text=読み上げる一言" を実行して登録する。textはURLエンコードし、時刻になったらそのまま読み上げられる一言にする（例: 25分たったよ、休憩しよう）。at は date -j -f "%Y-%m-%d %H:%M" "2026-01-01 17:00" +%s のように求める。
     - 登録済みリマインダーは \(KonReminderStore.fileURL.path(percentEncoded: false)) にJSONで保存されている。取り消しは open -g "konsole://remind/cancel?id=ID"、全部なら open -g "konsole://remind/cancel?all=1"。
+    - ツールの実行がユーザーに拒否されたときは、やらなかったことを一言で伝えるだけにする。同じ操作をやり直したり、別の手で回避したりしない。
     - ユーザーに「覚えておいて」と頼まれた好み・呼び方・言葉の意味などは、\(KonProfileStore.fileURL.path(percentEncoded: false)) のメモ（Markdown、なければ作る）の該当する見出しに一行で追記する。
     """
 
     private var claudeExecutablePath: String?
-    private var sessionId: String?
+    /// Session id per working folder, so switching projects and coming back
+    /// resumes that folder's conversation instead of starting over.
+    private var sessionIds: [String: String] = [:]
 
     /// One long-lived `claude` process fed through `--input-format stream-json`.
     /// Spawning a fresh CLI per request cost ~1.4s of startup (plus resuming the
@@ -128,9 +151,25 @@ actor KonClient {
     private var interruptFallbackTask: Task<Void, Never>?
     private static let interruptGracePeriod: Duration = .seconds(3)
 
+    /// Model and thinking budget the running CLI was last told to use, so an
+    /// unchanged tier doesn't resend the control requests.
+    private var appliedModel: String?
+    private var appliedThinkingTokens: Int?
+
     private struct ProcessConfig: Equatable {
         let mcpConfig: String?
         let systemPrompt: String
+        /// The CLI's working directory (the active project), nil = home.
+        let workingDirectory: String?
+        /// Other registered folders the CLI may touch without asking.
+        let extraDirectories: [String]
+        /// Route permission prompts to Kon (buttons in the bubble).
+        let asksPermission: Bool
+        /// Emit partial messages so the reply can be shown/read as it arrives.
+        let streamsPartials: Bool
+
+        /// Key for the resumable session belonging to this working folder.
+        var sessionKey: String { workingDirectory ?? "~" }
     }
     /// Stops the idle CLI so it doesn't hold ~300MB while Kon isn't being used.
     /// The next request restarts it and resumes the conversation via sessionId.
@@ -145,8 +184,16 @@ actor KonClient {
         scheduleIdleShutdown()
     }
 
-    /// - Parameter context: What the user is working on (see KonContextProvider).
-    func send(_ prompt: String, context: String? = nil) async throws -> KonReply {
+    /// - Parameters:
+    ///   - context: What the user is working on (see KonContextProvider).
+    ///   - onStream: Called with the reply as it arrives, when streaming is on.
+    ///   - onPermission: Asked before a tool that needs approval runs.
+    func send(
+        _ prompt: String,
+        context: String? = nil,
+        onStream: KonStreamHandler? = nil,
+        onPermission: KonPermissionHandler? = nil
+    ) async throws -> KonReply {
         // A barge-in sends the next request while the interrupted one is still
         // draining its output; the pipe carries one turn at a time.
         while isSending {
@@ -161,8 +208,15 @@ actor KonClient {
             interruptFallbackTask?.cancel()
             scheduleIdleShutdown()
         }
-        try await ensureProcess(config: await currentConfig())
+        let config = await currentConfig()
+        try await ensureProcess(config: config)
         guard let stdin, let reader else { throw KonClientError.invalidResponse }
+
+        let tier = await KonSettings.shared.tier(for: prompt)
+        let model = await KonSettings.shared.model(for: tier)
+        let thinkingTokens = await KonSettings.shared.thinking(for: tier).maxTokens
+        let showsModel = await KonSettings.shared.routesModelByRequest
+        applyModel(model, thinkingTokens: thinkingTokens)
 
         var content = Self.contextPrefix()
         if let context, !context.isEmpty {
@@ -185,12 +239,45 @@ actor KonClient {
         var actions: [String] = []
         /// Set when the CLI reports the request was refused for the usage limit.
         var rejection: KonClientError?
+        /// Text of the assistant message being streamed right now.
+        var streamedSegment = ""
+        var didStream = false
         while let line = await reader.nextLine() {
             guard let lineData = line.data(using: .utf8),
                   let event = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
                   let eventType = event["type"] as? String else { continue }
 
             switch eventType {
+            case "stream_event":
+                // Partial text of the reply, so it can be shown and read while
+                // the model is still writing. Sub-agent output is skipped.
+                guard let onStream, event["parent_tool_use_id"] == nil,
+                      let streamEvent = event["event"] as? [String: Any] else { break }
+                switch streamEvent["type"] as? String {
+                case "message_start":
+                    streamedSegment = ""
+                case "content_block_delta":
+                    guard let delta = streamEvent["delta"] as? [String: Any],
+                          delta["type"] as? String == "text_delta",
+                          let chunk = delta["text"] as? String, !chunk.isEmpty else { break }
+                    let isNewSegment = streamedSegment.isEmpty
+                    streamedSegment += chunk
+                    didStream = true
+                    let snapshot = streamedSegment
+                    await onStream(snapshot, isNewSegment)
+                default:
+                    break
+                }
+            case "control_request":
+                // The CLI asks before running a tool that needs approval
+                // (--permission-prompt-tool stdio); the user decides.
+                guard let requestId = event["request_id"] as? String,
+                      let request = event["request"] as? [String: Any],
+                      request["subtype"] as? String == "can_use_tool" else { break }
+                let toolName = request["tool_name"] as? String ?? "ツール"
+                let input = request["input"] as? [String: Any] ?? [:]
+                let allowed = await onPermission?(Self.permissionRequest(toolName: toolName, input: input)) ?? false
+                answerPermission(requestId: requestId, allowed: allowed, input: input)
             case "assistant":
                 actions.append(contentsOf: Self.actionSummaries(fromAssistantEvent: event))
                 // "rate_limit" also covers e.g. a model being unavailable, so
@@ -206,7 +293,7 @@ actor KonClient {
                 }
             case "result":
                 if let id = event["session_id"] as? String {
-                    sessionId = id
+                    sessionIds[config.sessionKey] = id
                 }
                 if isInterrupting {
                     throw KonClientError.interrupted
@@ -217,7 +304,15 @@ actor KonClient {
                     if let classified = KonClientError.classify(errorText: result) { throw classified }
                     throw KonClientError.agentError(result.isEmpty ? "エラーが発生しました。" : result)
                 }
-                return KonReply(text: result, actions: actions)
+                return KonReply(
+                    text: result,
+                    actions: actions,
+                    modelLabel: showsModel ? Self.modelLabel(fromResult: event, fallback: model) : nil,
+                    // Only claim it was streamed if what the user already saw
+                    // and heard is the reply itself, not a mid-turn aside.
+                    wasStreamed: didStream && streamedSegment.trimmingCharacters(in: .whitespacesAndNewlines)
+                        == result.trimmingCharacters(in: .whitespacesAndNewlines)
+                )
             default:
                 break
             }
@@ -283,6 +378,109 @@ actor KonClient {
         stopProcess()
     }
 
+    // MARK: - Model per request
+
+    /// Switches the running CLI's model and thinking budget for the next turn.
+    /// `set_model` / `set_max_thinking_tokens` are control requests, so routing
+    /// costs nothing — restarting the process per tier would cost ~1.4s.
+    private func applyModel(_ model: String, thinkingTokens: Int) {
+        if appliedModel != model {
+            writeControlRequest(["subtype": "set_model", "model": model])
+            appliedModel = model
+        }
+        if appliedThinkingTokens != thinkingTokens {
+            writeControlRequest([
+                "subtype": "set_max_thinking_tokens",
+                "max_thinking_tokens": thinkingTokens,
+                // Kon speaks its replies; thinking text is never shown.
+                "thinking_display": "omitted"
+            ])
+            appliedThinkingTokens = thinkingTokens
+        }
+    }
+
+    /// "claude-haiku-4-5-20251001" → "Haiku 4.5". The result event names the
+    /// model that actually answered, which beats the alias we asked for.
+    private static func modelLabel(fromResult event: [String: Any], fallback: String) -> String {
+        let used = (event["modelUsage"] as? [String: Any])?.keys.sorted().first
+        return modelLabel(used ?? fallback)
+    }
+
+    private static func modelLabel(_ identifier: String) -> String {
+        let families = ["haiku", "sonnet", "opus"]
+        let parts = identifier.split(separator: "-").map(String.init)
+        guard let index = parts.firstIndex(where: { families.contains($0.lowercased()) }) else {
+            return identifier
+        }
+        let version = parts[(index + 1)...].prefix { $0.count <= 2 && $0.allSatisfy(\.isNumber) }
+        let family = parts[index].capitalized
+        return version.isEmpty ? family : family + " " + version.joined(separator: ".")
+    }
+
+    // MARK: - Permission prompts
+
+    /// Turns the CLI's tool call into a question the user can answer without
+    /// reading JSON.
+    private static func permissionRequest(toolName: String, input: [String: Any]) -> KonPermissionRequest {
+        let detail: String?
+        switch toolName {
+        case "Bash":
+            detail = (input["command"] as? String).map { truncate($0, limit: 160) }
+        case "Read", "Edit", "Write", "NotebookEdit":
+            detail = (input["file_path"] as? String).map { truncate($0, limit: 120) }
+        case "WebFetch":
+            detail = (input["url"] as? String).map { truncate($0, limit: 120) }
+        default:
+            detail = nil
+        }
+        return KonPermissionRequest(
+            toolName: toolName,
+            summary: permissionSummary(forTool: toolName, input: input),
+            detail: detail
+        )
+    }
+
+    private static func permissionSummary(forTool name: String, input: [String: Any]) -> String {
+        switch name {
+        case "Bash": return "コマンドを実行してもいい？"
+        case "Write": return "ファイルを作ってもいい？"
+        case "Edit", "NotebookEdit": return "ファイルを書き換えてもいい？"
+        case "Read": return "このファイルを読んでもいい？"
+        case "WebFetch", "WebSearch": return "Webを見てもいい？"
+        case _ where name.hasPrefix("mcp__composio__"): return "外部サービスを操作してもいい？"
+        default: return "\(name) を実行してもいい？"
+        }
+    }
+
+    private func answerPermission(requestId: String, allowed: Bool, input: [String: Any]) {
+        let decision: [String: Any] = allowed
+            ? ["behavior": "allow", "updatedInput": input]
+            : ["behavior": "deny", "message": "ユーザーが許可しなかったので実行しません。"]
+        let response: [String: Any] = [
+            "type": "control_response",
+            "response": [
+                "subtype": "success",
+                "request_id": requestId,
+                "response": decision
+            ]
+        ]
+        write(response)
+    }
+
+    private func writeControlRequest(_ request: [String: Any]) {
+        write([
+            "type": "control_request",
+            "request_id": "kon_\(UUID().uuidString)",
+            "request": request
+        ])
+    }
+
+    private func write(_ object: [String: Any]) {
+        guard var line = try? JSONSerialization.data(withJSONObject: object) else { return }
+        line.append(0x0A)
+        try? stdin?.write(contentsOf: line)
+    }
+
     private func currentConfig() async -> ProcessConfig {
         let mcpConfig = await KonComposioStore.shared.mcpConfigJSON()
         var prompt = Self.systemPrompt
@@ -310,7 +508,21 @@ actor KonClient {
             \(accounts)
             """
         }
-        return ProcessConfig(mcpConfig: mcpConfig, systemPrompt: prompt)
+        if let projects = await KonSettings.shared.projectsPrompt {
+            prompt += "\n\n" + projects
+        }
+        let active = await KonSettings.shared.activeProject
+        let extraDirectories = await KonSettings.shared.usableProjects
+            .map(\.expandedPath)
+            .filter { $0 != active?.expandedPath }
+        return ProcessConfig(
+            mcpConfig: mcpConfig,
+            systemPrompt: prompt,
+            workingDirectory: active?.folderExists == true ? active?.expandedPath : nil,
+            extraDirectories: extraDirectories,
+            asksPermission: await KonSettings.shared.asksToolPermission,
+            streamsPartials: await KonSettings.shared.streamsReplies
+        )
     }
 
     private func ensureProcess(config: ProcessConfig) async throws {
@@ -337,16 +549,38 @@ actor KonClient {
             "--strict-mcp-config",
             "--setting-sources", "project"
         ]
+        if config.asksPermission {
+            // Undocumented in --help, but this is what routes permission
+            // prompts to us as can_use_tool control requests instead of the
+            // CLI silently refusing the tool call.
+            arguments += ["--permission-prompt-tool", "stdio"]
+            // auto モードは本当に全部通す（rm も git push も無言で走る、実測）。
+            // あぶない操作だけを ask に上書きして、ここだけ吹き出しの
+            // 「許可 / 拒否」に回す。
+            if let settingsJSON = KonPermissionRules.settingsJSON {
+                arguments += ["--settings", settingsJSON]
+            }
+        }
+        if config.streamsPartials {
+            arguments += ["--include-partial-messages"]
+        }
+        for directory in config.extraDirectories {
+            arguments += ["--add-dir", directory]
+        }
         if let mcpConfig = config.mcpConfig {
             arguments += ["--mcp-config", mcpConfig]
         }
-        if let sessionId {
+        if let sessionId = sessionIds[config.sessionKey] {
             arguments += ["--resume", sessionId]
         }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executablePath)
         process.arguments = arguments
+        // Relative paths and "このファイル" resolve in the active project.
+        if let workingDirectory = config.workingDirectory {
+            process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory, isDirectory: true)
+        }
         var environment = ProcessInfo.processInfo.environment
         // Load MCP tools up front instead of behind ToolSearch: Composio only
         // exposes a handful of meta tools, and deferring them cost a full
@@ -400,6 +634,8 @@ actor KonClient {
         stdin = nil
         reader = nil
         processConfig = nil
+        appliedModel = nil
+        appliedThinkingTokens = nil
     }
 
     private static func actionSummaries(fromAssistantEvent event: [String: Any]) -> [String] {
@@ -473,7 +709,7 @@ actor KonClient {
     }
 
     func resetSession() async {
-        sessionId = nil
+        sessionIds.removeAll()
         stopProcess()
         await prewarm()
     }

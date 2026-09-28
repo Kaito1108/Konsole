@@ -69,11 +69,46 @@ struct KonOverlayView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                if let modelLabel = viewModel.modelLabel {
+                    Text(modelLabel)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
                 LyricsText(
                     text: text,
                     readingStartedAt: viewModel.readingStartedAt,
-                    readingDuration: viewModel.readingDuration
+                    readingDuration: viewModel.readingDuration,
+                    isStreaming: viewModel.isStreaming
                 )
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 14)
+            .frame(maxWidth: 380, alignment: .leading)
+            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 20))
+        case .permission(let summary, let detail):
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 6) {
+                    Image(systemName: "hand.raised.fill")
+                        .foregroundStyle(.orange)
+                    Text(summary)
+                        .font(.system(size: 15, weight: .semibold))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let detail, !detail.isEmpty {
+                    Text(detail)
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(4)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                HStack(spacing: 8) {
+                    Button("許可") { viewModel.decidePermission(true) }
+                        .buttonStyle(.borderedProminent)
+                    Button("拒否") { viewModel.decidePermission(false) }
+                        .buttonStyle(.bordered)
+                }
+                .controlSize(.regular)
             }
             .padding(.horizontal, 18)
             .padding(.vertical, 14)
@@ -98,6 +133,8 @@ private struct LyricsText: View {
     let text: String
     let readingStartedAt: Date?
     let readingDuration: TimeInterval
+    /// Live reply: the newest line is the one being spoken, so no timing needed.
+    var isStreaming = false
 
     private static let font = Font.system(size: 15, weight: .medium)
     private static let maxHeight: CGFloat = 116
@@ -157,6 +194,7 @@ private struct LyricsText: View {
 
     /// Maps elapsed speech time to a line, weighting each line by its length.
     private func currentLine(at date: Date) -> Int {
+        if isStreaming { return max(lines.count - 1, 0) }
         guard let readingStartedAt, readingDuration > 0 else { return 0 }
         let progress = min(max(date.timeIntervalSince(readingStartedAt) / readingDuration, 0), 1)
         let target = progress * Double(text.count)

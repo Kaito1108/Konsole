@@ -6,7 +6,7 @@ import SwiftUI
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
-    private var overlayPanel: NSPanel!
+    private var overlayPanel: KonOverlayPanel!
     private let hotKeyManager = KonHotKeyManager.shared
     let chatViewModel = ChatViewModel()
     private let overlayViewModel = KonOverlayViewModel()
@@ -31,6 +31,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
         statusItem = item
+        updateStatusItemTitle()
+        observeActiveProject()
 
         let popover = NSPopover()
         popover.behavior = .transient
@@ -88,6 +90,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.overlayViewModel.showThinking()
             self?.showOverlay()
         }
+        chatViewModel.onStreamingReply = { [weak self] text in
+            guard let self else { return }
+            overlayHideTask?.cancel()
+            // Don't paint over a question that's waiting for an answer.
+            guard !overlayViewModel.isAskingPermission else { return }
+            overlayViewModel.showStreamingReply(text: text)
+            showOverlay()
+        }
+        chatViewModel.onPermissionRequest = { [weak self] request, decide in
+            self?.askPermission(request, decide: decide)
+        }
         chatViewModel.onReply = { [weak self] reply in
             self?.showReplyOverlay(reply)
         }
@@ -98,7 +111,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.showReplyOverlay(KonReply(text: text, actions: ["リマインダー"]))
         }
         chatViewModel.onSpeechStart = { [weak self] duration in
-            self?.overlayViewModel.startReading(duration: duration)
+            guard let self else { return }
+            // A streamed reply shows every line as it's spoken, so there's no
+            // progress to map onto a duration.
+            guard !overlayViewModel.isStreaming else { return }
+            overlayViewModel.startReading(duration: duration)
         }
         chatViewModel.onSpeechFinish = { [weak self] in
             guard let self else { return }
@@ -129,11 +146,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         _exit(0)
     }
 
-    // Kon schedules reminders by running `open -g "konsole://remind?..."`.
+    // Kon schedules reminders and switches working folders by running
+    // `open -g "konsole://remind?..."` / `open -g "konsole://project?..."`.
     func application(_ application: NSApplication, open urls: [URL]) {
         for url in urls {
-            KonReminderStore.shared.handle(url)
+            if url.host == "project" {
+                handleProjectURL(url)
+            } else {
+                KonReminderStore.shared.handle(url)
+            }
         }
+    }
+
+    // MARK: - Working folder (projects)
+
+    private func handleProjectURL(_ url: URL) {
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        func value(_ name: String) -> String? {
+            items.first { $0.name == name }?.value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let clear = value("clear"), !clear.isEmpty, clear != "0" {
+            settings.activeProjectId = nil
+            return
+        }
+        guard let spoken = value("name") ?? value("id"), !spoken.isEmpty else { return }
+        if let id = UUID(uuidString: spoken), settings.usableProjects.contains(where: { $0.id == id }) {
+            settings.activeProjectId = id
+            return
+        }
+        guard let project = settings.project(matching: spoken) else {
+            showReplyOverlay(
+                KonReply(text: "「\(spoken)」っていうフォルダは登録されてないよ。設定の作業フォルダで追加してね。", actions: []),
+                isSpoken: false
+            )
+            return
+        }
+        settings.activeProjectId = project.id
+    }
+
+    /// Keeps the menu bar showing which folder Kon is working in, wherever the
+    /// switch came from (voice, the menu, 設定).
+    private func observeActiveProject() {
+        withObservationTracking {
+            _ = settings.activeProjectId
+            _ = settings.projects
+        } onChange: { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                self.updateStatusItemTitle()
+                self.observeActiveProject()
+            }
+        }
+    }
+
+    private func updateStatusItemTitle() {
+        guard let button = statusItem?.button else { return }
+        let name = settings.activeProject?.trimmedName ?? ""
+        if name.isEmpty {
+            button.title = ""
+            button.imagePosition = .imageOnly
+            statusItem.length = NSStatusItem.squareLength
+        } else {
+            button.title = " " + String(name.prefix(12))
+            button.imagePosition = .imageLeading
+            statusItem.length = NSStatusItem.variableLength
+        }
+    }
+
+    @objc private func selectProject(_ sender: NSMenuItem) {
+        settings.activeProjectId = (sender.representedObject as? String).flatMap(UUID.init(uuidString:))
     }
 
     // MARK: - Status item popover (manual/typed chat)
@@ -162,6 +243,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func showContextMenu() {
         let menu = NSMenu()
+        if !settings.usableProjects.isEmpty {
+            let submenu = NSMenu()
+            let none = submenu.addItem(withTitle: "指定なし", action: #selector(selectProject(_:)), keyEquivalent: "")
+            none.target = self
+            none.state = settings.activeProject == nil ? .on : .off
+            for project in settings.usableProjects {
+                let item = submenu.addItem(withTitle: "\(project.trimmedName)（\(project.kindLabel)）", action: #selector(selectProject(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = project.id.uuidString
+                item.state = settings.activeProjectId == project.id ? .on : .off
+            }
+            menu.addItem(withTitle: "作業フォルダ", action: nil, keyEquivalent: "").submenu = submenu
+            menu.addItem(.separator())
+        }
         menu.addItem(withTitle: "設定…", action: #selector(openSettings), keyEquivalent: ",").target = self
         let updateItem = menu.addItem(withTitle: KonUpdater.shared.state == .building ? "更新中…" : "最新のソースで更新", action: #selector(updateFromSource), keyEquivalent: "")
         updateItem.target = self
@@ -214,9 +309,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Floating top-right overlay (voice session HUD)
 
     private func setUpOverlayPanel() {
-        let hostingController = NSHostingController(rootView: KonOverlayView(viewModel: overlayViewModel))
-        let panel = NSPanel(contentViewController: hostingController)
-        panel.styleMask = [.nonactivatingPanel, .borderless]
+        let panel = KonOverlayPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 220),
+            styleMask: [.nonactivatingPanel, .borderless],
+            backing: .buffered,
+            defer: false
+        )
+        panel.contentView = KonOverlayHostingView(rootView: KonOverlayView(viewModel: overlayViewModel))
         panel.level = .statusBar
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         panel.isOpaque = false
@@ -244,6 +343,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         overlayPanel.setFrameOrigin(origin)
     }
 
+    // MARK: - Permission question (許可 / 拒否 in the bubble)
+
+    /// Shows the question in the bubble and makes the panel clickable while it
+    /// is up; the rest of the time the overlay must not eat clicks.
+    private func askPermission(_ request: KonPermissionRequest, decide: @escaping (Bool) -> Void) {
+        overlayHideTask?.cancel()
+        overlayPanel.ignoresMouseEvents = false
+        NSSound(named: "Ping")?.play()
+        overlayViewModel.showPermission(summary: request.summary, detail: request.detail) { [weak self] allowed in
+            guard let self else {
+                decide(allowed)
+                return
+            }
+            overlayPanel.ignoresMouseEvents = true
+            // Back to "考え中" while Kon carries on with the answer.
+            if overlayViewModel.isAskingPermission || allowed {
+                overlayViewModel.showThinking()
+            }
+            decide(allowed)
+        }
+        showOverlay()
+    }
+
     private func showOverlay() {
         // Re-resolve per session: displays come and go, and "mouse" follows
         // the pointer. Not while visible, so the bubble doesn't jump mid-reply.
@@ -259,7 +381,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// drives scrolling and hiding; otherwise it scrolls at reading pace.
     private func showReplyOverlay(_ reply: KonReply, isSpoken: Bool? = nil) {
         overlayHideTask?.cancel()
-        overlayViewModel.showReply(text: reply.text, actions: reply.actions)
+        overlayPanel.ignoresMouseEvents = true
+        overlayViewModel.showReply(
+            text: reply.text,
+            actions: reply.actions,
+            isStreaming: reply.wasStreamed,
+            modelLabel: reply.modelLabel
+        )
         showOverlay()
         if !(isSpoken ?? settings.speakReplies) {
             // Nothing to sync to: scroll at a comfortable reading pace instead.
@@ -283,6 +411,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func hideOverlay() {
         overlayHideTask?.cancel()
         overlayViewModel.hide()
+        overlayPanel.ignoresMouseEvents = true
         overlayPanel.orderOut(nil)
     }
 
@@ -291,8 +420,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         overlayHideTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(seconds))
             guard !Task.isCancelled else { return }
+            // Never pull a question out from under the user.
+            guard self?.overlayViewModel.isAskingPermission != true else { return }
             self?.overlayViewModel.hide()
             self?.overlayPanel.orderOut(nil)
         }
     }
+}
+
+/// The floating bubble's window. It normally lets clicks through to whatever is
+/// underneath (`ignoresMouseEvents`), and only takes them while the 許可 / 拒否
+/// buttons are up.
+private final class KonOverlayPanel: NSPanel {
+    // A borderless panel can't become key by default, which would make the
+    // first click on a button do nothing but focus the panel.
+    override var canBecomeKey: Bool { true }
+}
+
+/// Lets the buttons react to the very first click, without the user having to
+/// click once to focus a menu bar app that has no windows.
+private final class KonOverlayHostingView: NSHostingView<KonOverlayView> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
