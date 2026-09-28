@@ -28,6 +28,15 @@ final class KonSettings {
         static let personaNotes = "personaNotes"
         static let learnsFromConversations = "learnsFromConversations"
         static let routines = "routines"
+        static let projects = "projects"
+        static let activeProjectId = "activeProjectId"
+        static let routesModelByRequest = "routesModelByRequest"
+        static let tierModels = "tierModels"
+        static let tierThinking = "tierThinking"
+        static let asksToolPermission = "asksToolPermission"
+        static let streamsReplies = "streamsReplies"
+        static let continuesConversation = "continuesConversation"
+        static let continuousSilenceTimeout = "continuousSilenceTimeout"
     }
 
     private let defaults: UserDefaults
@@ -89,6 +98,123 @@ final class KonSettings {
     /// "When I say X, do Y" phrases, handled by Kon from its system prompt.
     var routines: [KonRoutine] {
         didSet { defaults.set(try? JSONEncoder().encode(routines), forKey: Key.routines) }
+    }
+
+    // MARK: - 作業フォルダ（プロジェクト・参照）
+
+    /// Folders Kon can work in. The active one is the CLI's working directory.
+    var projects: [KonProject] {
+        didSet { defaults.set(try? JSONEncoder().encode(projects), forKey: Key.projects) }
+    }
+    /// Which folder Kon is working in right now; nil = home directory.
+    var activeProjectId: UUID? {
+        didSet { defaults.set(activeProjectId?.uuidString, forKey: Key.activeProjectId) }
+    }
+
+    var usableProjects: [KonProject] { projects.filter(\.isUsable) }
+
+    var activeProject: KonProject? {
+        guard let activeProjectId else { return nil }
+        return usableProjects.first { $0.id == activeProjectId }
+    }
+
+    /// Switches by what the user said ("Konsoleに移動して"), name or alias.
+    func project(matching spoken: String) -> KonProject? {
+        let candidates = usableProjects.filter { $0.matches(spoken) }
+        // Prefer the most specific match when several names overlap.
+        return candidates.max { $0.trimmedName.count < $1.trimmedName.count }
+    }
+
+    /// The working-folder part of Kon's system prompt, or nil when none is set up.
+    var projectsPrompt: String? {
+        let projects = usableProjects
+        guard !projects.isEmpty else { return nil }
+        let lines = projects.map { project -> String in
+            var line = "- \(project.trimmedName)（\(project.kindLabel)）: \(project.expandedPath)"
+            let aliases = project.aliasList
+            if !aliases.isEmpty {
+                line += " / 別の言い方: " + aliases.map { "「\($0)」" }.joined(separator: "・")
+            }
+            let notes = project.notes.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "\n", with: " ")
+            if !notes.isEmpty { line += " / メモ: \(notes)" }
+            return line
+        }
+        var prompt = """
+        ［作業フォルダ］登録されているフォルダ:
+        \(lines.joined(separator: "\n"))
+        """
+        if let active = activeProject {
+            prompt += "\n- 今の作業フォルダ: \(active.trimmedName)（\(active.expandedPath)）。相対パスやファイル名だけの指示はここを基準に探す。"
+            if active.isReadOnly {
+                prompt += "これは参照専用なので、中のファイルは変更しない。"
+            }
+        } else {
+            prompt += "\n- 今は作業フォルダを指定していない状態。ファイル操作の依頼は、どのフォルダか分からなければ短く確認する。"
+        }
+        prompt += """
+
+        - 「〇〇に移動して」「〇〇モードにして」のように作業フォルダの切り替えを頼まれたら、Bashで open -g "konsole://project?name=フォルダ名" を実行する（nameはURLエンコード。登録名か別の言い方のどれかと一致させる）。指定をやめるときは open -g "konsole://project?clear=1"。実行したら「〇〇に移動したよ」と一言で伝える。切り替えは次の会話から反映される。
+        - 登録されていないフォルダを頼まれたら、設定の「作業フォルダ」で登録してほしいと伝える。
+        """
+        return prompt
+    }
+
+    // MARK: - モデルの使い分け
+
+    /// Pick the model per request (かるい用/ふつう/重い用) instead of one model for everything.
+    var routesModelByRequest: Bool {
+        didSet { defaults.set(routesModelByRequest, forKey: Key.routesModelByRequest) }
+    }
+    /// Model name per tier, keyed by `KonModelTier.rawValue`; unset = the tier default.
+    private var tierModels: [String: String] {
+        didSet { defaults.set(tierModels, forKey: Key.tierModels) }
+    }
+    /// Thinking level per tier, keyed by `KonModelTier.rawValue`; unset = the tier default.
+    private var tierThinking: [String: String] {
+        didSet { defaults.set(tierThinking, forKey: Key.tierThinking) }
+    }
+
+    func model(for tier: KonModelTier) -> String {
+        let configured = tierModels[tier.rawValue]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (configured?.isEmpty == false ? configured! : tier.defaultModel)
+    }
+
+    func setModel(_ model: String, for tier: KonModelTier) {
+        tierModels[tier.rawValue] = model
+    }
+
+    func thinking(for tier: KonModelTier) -> KonThinkingLevel {
+        tierThinking[tier.rawValue].flatMap(KonThinkingLevel.init(rawValue:)) ?? tier.defaultThinking
+    }
+
+    func setThinking(_ level: KonThinkingLevel, for tier: KonModelTier) {
+        tierThinking[tier.rawValue] = level.rawValue
+    }
+
+    /// The tier a request runs on, honouring the routing switch.
+    func tier(for prompt: String) -> KonModelTier {
+        routesModelByRequest ? KonModelRouter.tier(for: prompt) : .mid
+    }
+
+    // MARK: - 許可の確認・連続会話
+
+    /// Ask before a tool that needs permission runs, with buttons in the bubble.
+    /// Off = the CLI decides on its own (risky calls just fail).
+    var asksToolPermission: Bool {
+        didSet { defaults.set(asksToolPermission, forKey: Key.asksToolPermission) }
+    }
+    /// Show and read the reply as it arrives instead of waiting for all of it.
+    var streamsReplies: Bool {
+        didSet { defaults.set(streamsReplies, forKey: Key.streamsReplies) }
+    }
+    /// Keep listening after Kon finishes talking, so a back-and-forth doesn't
+    /// need the hotkey every turn.
+    var continuesConversation: Bool {
+        didSet { defaults.set(continuesConversation, forKey: Key.continuesConversation) }
+    }
+    /// How long Kon waits for the next thing to be said before closing the mic.
+    var continuousSilenceTimeout: Double {
+        didSet { defaults.set(continuousSilenceTimeout, forKey: Key.continuousSilenceTimeout) }
     }
 
     /// The routine part of Kon's system prompt, or nil when there's none.
@@ -163,6 +289,11 @@ final class KonSettings {
             Key.userCallName: "",
             Key.personaNotes: "",
             Key.learnsFromConversations: true,
+            Key.routesModelByRequest: true,
+            Key.asksToolPermission: true,
+            Key.streamsReplies: true,
+            Key.continuesConversation: false,
+            Key.continuousSilenceTimeout: 4.0,
         ])
         speakReplies = defaults.bool(forKey: Key.speakReplies)
         voicevoxSpeakerId = defaults.integer(forKey: Key.voicevoxSpeakerId)
@@ -178,6 +309,15 @@ final class KonSettings {
         personaNotes = defaults.string(forKey: Key.personaNotes) ?? ""
         learnsFromConversations = defaults.bool(forKey: Key.learnsFromConversations)
         routines = defaults.data(forKey: Key.routines).flatMap { try? JSONDecoder().decode([KonRoutine].self, from: $0) } ?? []
+        projects = defaults.data(forKey: Key.projects).flatMap { try? JSONDecoder().decode([KonProject].self, from: $0) } ?? []
+        activeProjectId = defaults.string(forKey: Key.activeProjectId).flatMap(UUID.init(uuidString:))
+        routesModelByRequest = defaults.bool(forKey: Key.routesModelByRequest)
+        tierModels = defaults.dictionary(forKey: Key.tierModels) as? [String: String] ?? [:]
+        tierThinking = defaults.dictionary(forKey: Key.tierThinking) as? [String: String] ?? [:]
+        asksToolPermission = defaults.bool(forKey: Key.asksToolPermission)
+        streamsReplies = defaults.bool(forKey: Key.streamsReplies)
+        continuesConversation = defaults.bool(forKey: Key.continuesConversation)
+        continuousSilenceTimeout = defaults.double(forKey: Key.continuousSilenceTimeout)
         overlayDisplay = defaults.string(forKey: Key.overlayDisplay).flatMap(KonOverlayDisplay.init(rawValue:)) ?? .mouse
         pushToTalkShortcut = Self.loadShortcut(from: defaults, forKey: Key.pushToTalkShortcut) ?? .defaultPushToTalk
         cancelShortcut = Self.loadShortcut(from: defaults, forKey: Key.cancelShortcut) ?? .defaultCancel

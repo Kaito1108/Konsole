@@ -38,6 +38,12 @@ final class ChatViewModel {
     var onFailure: ((_ reply: KonReply, _ isSpoken: Bool) -> Void)?
     /// Called when a reminder is announced, with its text (before it's read aloud).
     var onAnnouncement: ((String) -> Void)?
+    /// Called repeatedly with the reply as it's still being written, so the
+    /// bubble can show it while Kon is talking.
+    var onStreamingReply: ((String) -> Void)?
+    /// Called when a tool needs the user's approval. Answer via the closure
+    /// (true = allow once); Kon waits until it's called.
+    var onPermissionRequest: ((KonPermissionRequest, @escaping (Bool) -> Void) -> Void)?
 
     private let client = KonClient()
     private let speechClient = KonSpeechClient()
@@ -50,6 +56,19 @@ final class ChatViewModel {
     /// Bumped per request, so a reply that was cut off is dropped when it lands.
     private var sendGeneration = 0
     private var wasBusy = false
+    /// Keep the mic open after Kon answers (連続会話), until silence or Escape.
+    private var isContinuing = false
+    /// The assistant message being streamed, and how much of it has been
+    /// handed to the speech queue.
+    private var streamSegmentText = ""
+    private var streamedText = ""
+    private var spokenStreamCount = 0
+    private var isStreamingSpeech = false
+    /// Waiting on 許可 / 拒否 for a tool call.
+    private var pendingPermission: CheckedContinuation<Bool, Never>?
+    private var permissionTimeoutTask: Task<Void, Never>?
+    /// An unanswered question is denied rather than left hanging.
+    private static let permissionTimeout: Duration = .seconds(90)
 
     init() {
         // Boot the claude CLI now so the first question doesn't pay for it.
@@ -68,7 +87,16 @@ final class ChatViewModel {
             self?.send(text)
         }
         listener.onSessionEndedWithoutCommand = { [weak self] reason in
-            self?.onListeningEndedWithoutCommand?(reason)
+            guard let self else { return }
+            // In a continuous conversation, silence just means the user is done
+            // talking; closing the bubble quietly beats "何も聞こえなかったよ".
+            let wasContinuing = isContinuing
+            isContinuing = false
+            if wasContinuing, reason == .noSpeech || reason == .tooShort {
+                onCancel?()
+                return
+            }
+            onListeningEndedWithoutCommand?(reason)
         }
         listener.onError = { [weak self] error in
             self?.errorMessage = error.localizedDescription
@@ -84,6 +112,7 @@ final class ChatViewModel {
     /// instead (barge-in).
     func toggleVoiceSession() {
         if listener.isListening {
+            isContinuing = false
             listener.cancelSession()
             return
         }
@@ -94,6 +123,7 @@ final class ChatViewModel {
         stopSpeaking()
         do {
             try listener.startSession(silenceTimeout: settings.sessionSilenceTimeout)
+            isContinuing = settings.continuesConversation
             // If the CLI was stopped for idleness, restart it while the user is
             // still talking so the reply doesn't pay for the launch.
             Task { [client] in await client.prewarm() }
@@ -105,10 +135,13 @@ final class ChatViewModel {
 
     /// Escape: stop whatever Kon is doing right now.
     func cancelCurrentActivity() {
+        isContinuing = false
         if listener.isListening {
             listener.cancelSession()
             return
         }
+        // A pending question would otherwise leave the CLI waiting forever.
+        answerPendingPermission(false)
         if isSending {
             interruptReply()
         }
@@ -133,6 +166,7 @@ final class ChatViewModel {
 
     private func interruptReply() {
         guard isSending else { return }
+        answerPendingPermission(false)
         sendGeneration += 1
         isSending = false
         updateBusy()
@@ -141,6 +175,7 @@ final class ChatViewModel {
 
     private func stopSpeaking() {
         speechClient.stop()
+        isStreamingSpeech = false
         isSpeaking = false
         updateBusy()
     }
@@ -151,12 +186,144 @@ final class ChatViewModel {
         speechClient.speak(
             text,
             onStart: { [weak self] duration in self?.onSpeechStart?(duration) },
-            onFinish: { [weak self] in
-                self?.isSpeaking = false
-                self?.updateBusy()
-                self?.onSpeechFinish?()
-            }
+            onFinish: { [weak self] in self?.finishSpeaking() }
         )
+    }
+
+    private func finishSpeaking() {
+        isStreamingSpeech = false
+        isSpeaking = false
+        updateBusy()
+        onSpeechFinish?()
+        resumeContinuousListeningIfNeeded()
+    }
+
+    // MARK: - 連続会話
+
+    /// Reopens the mic once Kon has finished talking, so a back-and-forth
+    /// doesn't need the hotkey every turn.
+    private func resumeContinuousListeningIfNeeded() {
+        guard isContinuing, settings.continuesConversation else { return }
+        guard !isSending, !isSpeaking, !listener.isListening else { return }
+        Task {
+            // A beat, so the tail of Kon's own voice doesn't reopen the mic onto itself.
+            try? await Task.sleep(for: .milliseconds(350))
+            guard isContinuing, !isSending, !isSpeaking, !listener.isListening else { return }
+            do {
+                try listener.startSession(silenceTimeout: settings.continuousSilenceTimeout)
+                onListeningStart?()
+            } catch {
+                isContinuing = false
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    // MARK: - 許可の確認
+
+    private func requestPermission(_ request: KonPermissionRequest) async -> Bool {
+        guard let onPermissionRequest else { return false }
+        answerPendingPermission(false)
+        let generation = sendGeneration
+        let allowed = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            pendingPermission = continuation
+            onPermissionRequest(request) { [weak self] allowed in
+                self?.answerPendingPermission(allowed)
+            }
+            permissionTimeoutTask = Task { [weak self] in
+                try? await Task.sleep(for: Self.permissionTimeout)
+                self?.answerPendingPermission(false)
+            }
+        }
+        permissionTimeoutTask?.cancel()
+        return generation == sendGeneration ? allowed : false
+    }
+
+    private func answerPendingPermission(_ allowed: Bool) {
+        guard let continuation = pendingPermission else { return }
+        pendingPermission = nil
+        permissionTimeoutTask?.cancel()
+        continuation.resume(returning: allowed)
+    }
+
+    // MARK: - ストリーミング
+
+    private func beginStreaming() {
+        streamSegmentText = ""
+        streamedText = ""
+        spokenStreamCount = 0
+        isStreamingSpeech = false
+    }
+
+    /// One update of the reply in progress: shows it and queues up whatever
+    /// full sentences it now contains for reading aloud.
+    private func receiveStream(_ text: String, isNewSegment: Bool, generation: Int) {
+        guard generation == sendGeneration else { return }
+        if isNewSegment {
+            // Kon said something before using a tool; that part is complete.
+            flushSpeechStream(all: true)
+            streamedText += streamSegmentText
+            spokenStreamCount = 0
+        }
+        streamSegmentText = text
+        onStreamingReply?(text)
+        guard settings.speakReplies else { return }
+        if !isStreamingSpeech {
+            isStreamingSpeech = true
+            isSpeaking = true
+            updateBusy()
+            speechClient.startStream(
+                onStart: { [weak self] duration in self?.onSpeechStart?(duration) },
+                onFinish: { [weak self] in self?.finishSpeaking() }
+            )
+        }
+        flushSpeechStream(all: false)
+    }
+
+    /// Hands finished sentences to the speech queue, keeping the tail that is
+    /// still being written (`all` takes the tail too).
+    private func flushSpeechStream(all: Bool) {
+        guard isStreamingSpeech else { return }
+        let pending = String(streamSegmentText.dropFirst(spokenStreamCount))
+        guard !pending.isEmpty else { return }
+        let chunk: String
+        if all {
+            chunk = pending
+        } else if let boundary = Self.sentenceBoundary(in: pending) {
+            chunk = String(pending[pending.startIndex..<boundary])
+        } else {
+            return
+        }
+        spokenStreamCount += chunk.count
+        speechClient.appendStream(chunk)
+    }
+
+    private static let sentenceEnds: Set<Character> = ["。", "！", "？", "!", "?", "\n"]
+    private static let clauseEnds: Set<Character> = ["、", ",", "。"]
+    /// A clause this long is broken at a comma so reading starts sooner.
+    private static let clauseBreakLength = 48
+
+    /// Index just past the last complete sentence, or nil while one is still
+    /// being written.
+    private static func sentenceBoundary(in text: String) -> String.Index? {
+        if let index = text.lastIndex(where: { sentenceEnds.contains($0) }) {
+            return text.index(after: index)
+        }
+        guard text.count >= clauseBreakLength,
+              let index = text.lastIndex(where: { clauseEnds.contains($0) }) else { return nil }
+        return text.index(after: index)
+    }
+
+    /// Reads out whatever is left of a streamed reply, plus the final text if
+    /// it isn't what was streamed, and closes the queue.
+    private func endStreamedSpeech(finalText: String) {
+        flushSpeechStream(all: true)
+        let spoken = streamedText + streamSegmentText
+        let text = finalText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !text.isEmpty, !spoken.contains(text) {
+            speechClient.appendStream(text)
+        }
+        speechClient.endStream()
     }
 
     private func updateBusy() {
@@ -191,13 +358,37 @@ final class ChatViewModel {
             do {
                 let context = await contextProvider.snapshot()
                 guard generation == sendGeneration else { return }
-                let reply = try await client.send(trimmed, context: context)
+                let streams = settings.streamsReplies
+                if streams { beginStreaming() }
+                var onStream: KonStreamHandler?
+                if streams {
+                    onStream = { [weak self] text, isNewSegment in
+                        self?.receiveStream(text, isNewSegment: isNewSegment, generation: generation)
+                    }
+                }
+                let onPermission: KonPermissionHandler = { [weak self] request in
+                    guard let self else { return false }
+                    return await requestPermission(request)
+                }
+                let reply = try await client.send(
+                    trimmed,
+                    context: context,
+                    onStream: onStream,
+                    onPermission: onPermission
+                )
                 guard generation == sendGeneration else { return }
                 append(KonMessage(role: .kon, text: reply.text, actions: reply.actions))
                 onReply?(reply)
                 KonProfileStore.shared.learnIfNeeded()
                 if settings.speakReplies {
-                    speak(reply.text)
+                    if isStreamingSpeech {
+                        endStreamedSpeech(finalText: reply.text)
+                    } else {
+                        speak(reply.text)
+                    }
+                } else {
+                    // Nothing to wait for before listening again.
+                    resumeContinuousListeningIfNeeded()
                 }
             } catch KonClientError.interrupted {
                 // Cut off on purpose; nothing to report.
@@ -216,6 +407,7 @@ final class ChatViewModel {
     /// Tells the user why there's no answer — in the chat, the bubble and,
     /// for things they can act on (limit, overload), out loud.
     private func report(_ error: Error) {
+        isContinuing = false
         let message = error.localizedDescription
         errorMessage = message
         let label: String

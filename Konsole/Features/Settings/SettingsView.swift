@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// Settings window: a custom sidebar (logo + sections) and a content area
@@ -29,6 +30,8 @@ struct SettingsView: View {
     private var content: some View {
         switch selection {
         case .general: GeneralPane()
+        case .projects: ProjectsPane()
+        case .models: ModelsPane()
         case .persona: PersonaPane()
         case .routines: RoutinesPane()
         case .voice: VoicePane()
@@ -40,13 +43,15 @@ struct SettingsView: View {
 }
 
 enum SettingsSection: String, CaseIterable, Identifiable {
-    case general, persona, routines, voice, shortcuts, integrations, history
+    case general, projects, models, persona, routines, voice, shortcuts, integrations, history
 
     var id: Self { self }
 
     var title: String {
         switch self {
         case .general: "一般"
+        case .projects: "作業フォルダ"
+        case .models: "モデル"
         case .persona: "性格・学習"
         case .routines: "定型フレーズ"
         case .voice: "音声"
@@ -59,6 +64,8 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     var systemImage: String {
         switch self {
         case .general: "gearshape"
+        case .projects: "folder"
+        case .models: "cpu"
         case .persona: "pawprint"
         case .routines: "text.bubble"
         case .voice: "waveform"
@@ -382,6 +389,246 @@ private struct OverlayDisplayPicker: View {
     }
 }
 
+// MARK: - Projects
+
+private struct ProjectsPane: View {
+    @Bindable private var settings = KonSettings.shared
+
+    var body: some View {
+        VStack(spacing: 16) {
+            PaneHeader(
+                title: "作業フォルダ",
+                subtitle: "コンが作業するフォルダを登録します。声で「〇〇に移動して」と言えば切り替わります"
+            )
+            SettingsCard(title: "今の作業フォルダ") {
+                SettingRow(title: "作業フォルダ", detail: settings.activeProject?.expandedPath ?? "指定なし（ホームフォルダ）") {
+                    Picker("", selection: $settings.activeProjectId) {
+                        Text("指定なし").tag(UUID?.none)
+                        ForEach(settings.usableProjects) { project in
+                            Text(project.trimmedName).tag(Optional(project.id))
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(maxWidth: 220)
+                }
+                Text("ファイル名だけの指示や「このファイル」は、このフォルダを基準に探します。登録したほかのフォルダも読めます。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if settings.projects.isEmpty {
+                SettingsCard {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("まだ登録されていません")
+                        Text("例: 名前「Konsole」、フォルダ「~/WorkSpace/Swift/Konsole」→ 「Konsoleに移動して」で切り替わります")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            ForEach(settings.projects) { project in
+                ProjectCard(
+                    project: binding(for: project),
+                    isActive: settings.activeProjectId == project.id,
+                    onActivate: { settings.activeProjectId = project.id },
+                    onDelete: {
+                        if settings.activeProjectId == project.id { settings.activeProjectId = nil }
+                        settings.projects.removeAll { $0.id == project.id }
+                    }
+                )
+            }
+            HStack {
+                Text("「参照」にすると、コンは中を読むだけで変更しません。変更は次に話しかけたときから反映されます。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    settings.projects.append(KonProject(name: "", path: ""))
+                } label: {
+                    Label("追加", systemImage: "plus")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(SettingsPalette.accent)
+            }
+        }
+    }
+
+    /// Looks the project up by id on every access, so a focused text field
+    /// doesn't read a stale index after a row above it is deleted.
+    private func binding(for project: KonProject) -> Binding<KonProject> {
+        Binding(
+            get: { settings.projects.first { $0.id == project.id } ?? project },
+            set: { newValue in
+                guard let index = settings.projects.firstIndex(where: { $0.id == project.id }) else { return }
+                settings.projects[index] = newValue
+            }
+        )
+    }
+}
+
+private struct ProjectCard: View {
+    @Binding var project: KonProject
+    let isActive: Bool
+    let onActivate: () -> Void
+    let onDelete: () -> Void
+
+    var body: some View {
+        SettingsCard {
+            HStack(spacing: 10) {
+                TextField("名前（例: Konsole、ノートブック）", text: $project.name)
+                    .textFieldStyle(.roundedBorder)
+                if isActive {
+                    Text("使用中")
+                        .font(.caption)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(SettingsPalette.accent.opacity(0.18), in: Capsule())
+                }
+                Toggle("", isOn: $project.isEnabled)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .tint(SettingsPalette.accent)
+                Button(role: .destructive, action: onDelete) {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.borderless)
+                .help("削除")
+            }
+            HStack(spacing: 8) {
+                TextField("フォルダのパス", text: $project.path)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12, design: .monospaced))
+                Button("選ぶ…") {
+                    if let path = Self.chooseFolder() { project.path = path }
+                }
+            }
+            .padding(.top, 10)
+            if !project.trimmedPath.isEmpty, !project.folderExists {
+                Text("このフォルダが見つからないよ")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .padding(.top, 4)
+            }
+            TextField("別の言い方（例: コンソール、こんそーる）", text: $project.aliases)
+                .textFieldStyle(.roundedBorder)
+                .padding(.top, 8)
+            Text("聞き取りの揺れに備えて、「、」で区切って登録できます")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.top, 4)
+            Toggle("参照専用（中のファイルは変更しない）", isOn: $project.isReadOnly)
+                .toggleStyle(.checkbox)
+                .padding(.top, 8)
+            Text("コンへのメモ")
+                .padding(.top, 10)
+                .padding(.bottom, 6)
+            MemoEditor(text: $project.notes, minHeight: 56, placeholder: "例: Swiftのメニューバーアプリ。ビルドはxcodebuildで。")
+            HStack {
+                Spacer()
+                Button("この作業フォルダにする", action: onActivate)
+                    .disabled(isActive || !project.isUsable)
+            }
+            .padding(.top, 10)
+        }
+        .opacity(project.isEnabled ? 1 : 0.6)
+    }
+
+    private static func chooseFolder() -> String? {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "選択"
+        guard panel.runModal() == .OK, let url = panel.url else { return nil }
+        return url.path(percentEncoded: false)
+    }
+}
+
+// MARK: - Models
+
+private struct ModelsPane: View {
+    @Bindable private var settings = KonSettings.shared
+
+    var body: some View {
+        VStack(spacing: 16) {
+            PaneHeader(title: "モデル", subtitle: "用件の重さでモデルと考える時間を使い分けます")
+            SettingsCard(title: "使い分け") {
+                SettingRow(
+                    title: "用件に合わせて切り替える",
+                    detail: "あいさつや時刻はいちばん速いモデル、調査やコードは賢いモデルで答えます"
+                ) {
+                    Toggle("", isOn: $settings.routesModelByRequest)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .tint(SettingsPalette.accent)
+                }
+                Divider()
+                ForEach(KonModelTier.allCases) { tier in
+                    ModelTierRow(tier: tier)
+                    if tier != KonModelTier.allCases.last { Divider() }
+                }
+                Text("モデルは haiku / sonnet / opus のような別名でも、claude-opus-5 のようなIDでも指定できます。別名なら、アカウントで使える最新のモデルが自動で当たります。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 10)
+            }
+
+            SettingsCard(title: "話し方・確認") {
+                SettingRow(title: "書けたところから話す", detail: "答えが全部そろうのを待たず、文ができるたびに読み上げます") {
+                    Toggle("", isOn: $settings.streamsReplies)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .tint(SettingsPalette.accent)
+                }
+                Divider()
+                SettingRow(title: "あぶない操作の前に確認する", detail: "削除・外部送信・鍵ファイルなどのときだけ、吹き出しに「許可 / 拒否」のボタンを出します。切ると、それも黙って実行されます") {
+                    Toggle("", isOn: $settings.asksToolPermission)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .tint(SettingsPalette.accent)
+                }
+            }
+            Text("どちらも変更は次に話しかけたときから反映されます。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+private struct ModelTierRow: View {
+    let tier: KonModelTier
+    private let settings = KonSettings.shared
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(tier.title)
+                .font(.subheadline.weight(.semibold))
+            HStack(spacing: 8) {
+                TextField("モデル", text: Binding(
+                    get: { settings.model(for: tier) },
+                    set: { settings.setModel($0, for: tier) }
+                ))
+                .textFieldStyle(.roundedBorder)
+                .frame(maxWidth: 170)
+                Picker("", selection: Binding(
+                    get: { settings.thinking(for: tier) },
+                    set: { settings.setThinking($0, for: tier) }
+                )) {
+                    ForEach(KonThinkingLevel.allCases) { level in
+                        Text(level.title).tag(level)
+                    }
+                }
+                .labelsHidden()
+                .frame(maxWidth: 180)
+                Spacer(minLength: 0)
+            }
+        }
+        .padding(.vertical, 10)
+        .opacity(settings.routesModelByRequest || tier == .mid ? 1 : 0.45)
+    }
+}
+
 // MARK: - Persona
 
 private struct PersonaPane: View {
@@ -674,6 +921,27 @@ private struct VoicePane: View {
                 Text("\(settings.pushToTalkShortcut.displayString)を押してから何も話さないと、この時間（最低3秒）で自動的に終わります。話し終わったあとは、この時間（最大1.6秒）黙ると文字起こしに進みます。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+
+            SettingsCard(title: "連続会話") {
+                SettingRow(
+                    title: "答えたあとも聞き続ける",
+                    detail: "コンが話し終わったらマイクが開くので、\(settings.pushToTalkShortcut.displayString)を押し直さずに続けて話せます"
+                ) {
+                    Toggle("", isOn: $settings.continuesConversation)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .tint(SettingsPalette.accent)
+                }
+                if settings.continuesConversation {
+                    Divider()
+                    SliderRow(title: "次の言葉を待つ時間", value: $settings.continuousSilenceTimeout, range: 2...15, step: 0.5) {
+                        "\($0.formatted(.number.precision(.fractionLength(0...1))))秒"
+                    }
+                    Text("この時間だまっていると、何も言わずに会話を終わります。\(settings.cancelShortcut.displayString)でも終われます。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
         .task { await loadVoices() }
