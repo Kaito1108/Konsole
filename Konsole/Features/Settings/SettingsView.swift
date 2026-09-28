@@ -581,7 +581,7 @@ private struct ModelsPane: View {
                         .tint(SettingsPalette.accent)
                 }
                 Divider()
-                SettingRow(title: "あぶない操作の前に確認する", detail: "削除・外部送信・鍵ファイルなどのときだけ、吹き出しに「許可 / 拒否」のボタンを出します。切ると、それも黙って実行されます") {
+                SettingRow(title: "確認を求められたら聞く", detail: "Claude（autoモード）が確認を求めてきたときだけ、吹き出しに「許可 / 拒否」のボタンを出します。切ると、それも黙って実行されます") {
                     Toggle("", isOn: $settings.asksToolPermission)
                         .labelsHidden()
                         .toggleStyle(.switch)

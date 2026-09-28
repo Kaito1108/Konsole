@@ -554,12 +554,10 @@ actor KonClient {
             // prompts to us as can_use_tool control requests instead of the
             // CLI silently refusing the tool call.
             arguments += ["--permission-prompt-tool", "stdio"]
-            // auto モードは本当に全部通す（rm も git push も無言で走る、実測）。
-            // あぶない操作だけを ask に上書きして、ここだけ吹き出しの
-            // 「許可 / 拒否」に回す。
-            if let settingsJSON = KonPermissionRules.settingsJSON {
-                arguments += ["--settings", settingsJSON]
-            }
+            // ask ルールは足さない。auto モードの判断をそのまま使い、CLI が
+            // 自分で聞いてきた呼び出しだけを吹き出しの「許可 / 拒否」に回す。
+            // 以前は git push や gh pr merge まで ask に落としていて、PR を
+            // 作るたびに確認が出ていた。
         }
         if config.streamsPartials {
             arguments += ["--include-partial-messages"]
