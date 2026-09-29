@@ -19,8 +19,12 @@ enum KonListenEndReason: Equatable {
     case cancelled
     /// Nothing loud enough was heard before the wait ran out.
     case noSpeech
-    /// The mic never delivered audio (device switch, Bluetooth hiccup).
+    /// The mic never delivered audio (no input device, or a device that kept
+    /// changing under us even after retries).
     case micUnavailable
+    /// macOS hasn't granted this app microphone access, so the input device
+    /// only ever sends silence.
+    case micDenied
     /// Only a blip (a cough, a click) was heard.
     case tooShort
     /// Speech was heard but whisper made nothing of it.
@@ -31,11 +35,14 @@ enum KonListenEndReason: Equatable {
 
 enum KonListenerError: Error, LocalizedError {
     case converterUnavailable
+    case noInputDevice
 
     var errorDescription: String? {
         switch self {
         case .converterUnavailable:
             return "マイク入力のフォーマット変換に失敗しました。"
+        case .noInputDevice:
+            return "使用できるマイクが見つかりませんでした。"
         }
     }
 }
@@ -75,6 +82,15 @@ final class KonListener: @unchecked Sendable {
     /// constant background level stuck above the voice threshold (another
     /// app's voice processing boosting the mic) stops counting as speech.
     private static let noiseWindowSeconds: Double = 2.0
+    /// Starting input on AirPods (any Bluetooth mic) makes macOS switch the
+    /// device to its headset profile, which posts a configuration change a
+    /// moment after the engine starts and stops the tap. Rebuild the capture
+    /// chain instead of calling the session dead — but not forever, in case
+    /// the device is genuinely flapping.
+    private static let maxEngineRestarts = 3
+    /// How long to let the device settle before rebuilding the chain; starting
+    /// again immediately just hits the same half-switched device.
+    private static let engineRestartDelay: Double = 0.25
     /// Speech must be at least this much louder than the noise floor.
     private static let minVoiceToNoiseRatio: Float = 1.6
     /// Hard ceiling on the noise floor. Without it `minVoiceToNoiseRatio`
@@ -101,6 +117,9 @@ final class KonListener: @unchecked Sendable {
     private var engine: AVAudioEngine?
     private let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
     private var converter: AVAudioConverter?
+    /// The input format `converter` was built for. A profile switch changes it
+    /// mid-session, and a converter fed the wrong format produces nothing.
+    private var converterInputFormat: AVAudioFormat?
 
     // Only touched from the audio tap's serial callback thread.
     private var utteranceSamples: [Float] = []
@@ -124,33 +143,94 @@ final class KonListener: @unchecked Sendable {
     private var recentLevelsSeconds: Double = 0
     private var watchdog: Timer?
     private var configurationObserver: NSObjectProtocol?
+    /// Session-wide (unlike `audioStartedAt`, which is per capture chain).
+    private var sessionStartedAt: CFAbsoluteTime = 0
+    private var didHearAudioThisSession = false
+    private var engineRestarts = 0
+    /// The macOS microphone prompt is up; a second ⌥Space must not stack another.
+    private var isRequestingMicAccess = false
 
     private(set) var isListening = false
 
     func startSession(silenceTimeout: TimeInterval) throws {
-        guard !isListening else { return }
+        guard !isListening, !isRequestingMicAccess else { return }
 
-        let engine = AVAudioEngine()
-        let input = engine.inputNode
-        let inputFormat = input.outputFormat(forBus: 0)
-        guard let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
-            throw KonListenerError.converterUnavailable
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            break
+        case .notDetermined:
+            // First ever session: macOS shows its prompt, and the input device
+            // sends nothing but silence until the user answers — so wait for
+            // the answer instead of starting into a dead mic.
+            isRequestingMicAccess = true
+            AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.isRequestingMicAccess = false
+                    guard granted else {
+                        self.notifySessionEndedWithoutCommand(.micDenied)
+                        return
+                    }
+                    do {
+                        try self.startSession(silenceTimeout: silenceTimeout)
+                    } catch {
+                        self.notifyError(error)
+                        self.notifySessionEndedWithoutCommand(.micUnavailable)
+                    }
+                }
+            }
+            return
+        default:
+            // Denied or restricted: without this the session just sat there
+            // hearing digital silence and blamed the input device.
+            notifySessionEndedWithoutCommand(.micDenied)
+            return
         }
-        self.converter = converter
+
         utteranceSamples.removeAll()
         isCapturingUtterance = false
         silenceSeconds = 0
         utterancePeak = 0
-        noiseFloor = Self.initialNoiseFloor
-        audioStartedAt = nil
         sessionSilenceTimeout = max(silenceTimeout, Self.minPreSpeechWaitSeconds)
         silenceHangoverSeconds = min(silenceTimeout, Self.maxSilenceHangoverSeconds)
+        sessionStartedAt = CFAbsoluteTimeGetCurrent()
+        didHearAudioThisSession = false
+        engineRestarts = 0
+
+        isListening = true
+        do {
+            try startEngine()
+        } catch {
+            isListening = false
+            throw error
+        }
+        notifyState(.preparing)
+    }
+
+    /// Builds and starts a fresh capture chain for the current session. Called
+    /// again after a device change, so it only resets per-chain state.
+    /// Main thread only.
+    private func startEngine() throws {
+        let engine = AVAudioEngine()
+        let input = engine.inputNode
+        let inputFormat = input.outputFormat(forBus: 0)
+        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
+            throw KonListenerError.noInputDevice
+        }
+
         isClosing = false
+        audioStartedAt = nil
         lastBufferAt = nil
+        noiseFloor = Self.initialNoiseFloor
         recentLevels.removeAll()
         recentLevelsSeconds = 0
+        converter = nil
+        converterInputFormat = nil
 
-        input.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
+        // `nil` keeps the tap on whatever format the device is using right
+        // now; pinning the format captured before a Bluetooth profile switch
+        // leaves the tap silent afterwards.
+        input.installTap(onBus: 0, bufferSize: 4096, format: nil) { [weak self] buffer, _ in
             self?.process(buffer: buffer)
         }
 
@@ -162,35 +242,70 @@ final class KonListener: @unchecked Sendable {
             throw error
         }
         self.engine = engine
-        isListening = true
-        notifyState(.preparing)
 
-        // If the mic never comes up (device switch, engine stopped), don't
+        // If this chain never comes up (device switch, engine stopped), don't
         // sit in "listening" forever.
         let engineID = ObjectIdentifier(engine)
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.micStartupTimeoutSeconds + sessionSilenceTimeout) { [weak self] in
             guard let self, let current = self.engine, ObjectIdentifier(current) == engineID,
                   self.audioStartedAt == nil else { return }
-            self.cancelSession(reason: .micUnavailable)
+            Self.logger.notice("Mic delivered no audio after starting")
+            self.recoverOrEnd()
         }
 
         configurationObserver = NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
         ) { [weak self] _ in
+            // AirPods post this right after input starts, as macOS switches
+            // them to the headset profile. It stops the tap, so the session
+            // has to be rebuilt on the new device rather than abandoned.
             Self.logger.notice("Audio engine configuration changed mid-session")
-            self?.endInterruptedSession()
+            self?.recoverOrEnd()
         }
-        let sessionStartedAt = CFAbsoluteTimeGetCurrent()
+
         let maxSessionSeconds = Self.micStartupTimeoutSeconds + sessionSilenceTimeout + Self.maxUtteranceSeconds + 5
         watchdog = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             guard let self, self.isListening, !self.isClosing else { return }
             let now = CFAbsoluteTimeGetCurrent()
             if let lastBufferAt = self.lastBufferAt, now - lastBufferAt >= Self.audioStallSeconds {
                 Self.logger.notice("Mic stopped delivering audio mid-session")
-                self.endInterruptedSession()
-            } else if now - sessionStartedAt >= maxSessionSeconds {
+                self.recoverOrEnd()
+            } else if now - self.sessionStartedAt >= maxSessionSeconds {
                 Self.logger.notice("Voice session hit its hard time limit")
                 self.endInterruptedSession()
+            }
+        }
+    }
+
+    /// The mic isn't delivering: it never came up, or it stopped mid-session.
+    /// A Bluetooth profile switch looks exactly like this, so rebuild the
+    /// capture chain a few times before telling the user. Main thread only.
+    private func recoverOrEnd() {
+        guard isListening, !isClosing else { return }
+        // Something was already said: keep it rather than restarting onto it.
+        if isCapturingUtterance, !utteranceSamples.isEmpty {
+            endInterruptedSession()
+            return
+        }
+        // Restarting can't buy back a session that is already out of time.
+        let outOfTime = !didHearAudioThisSession
+            && CFAbsoluteTimeGetCurrent() - sessionStartedAt >= Self.micStartupTimeoutSeconds + sessionSilenceTimeout
+        guard engineRestarts < Self.maxEngineRestarts, !outOfTime else {
+            cancelSession(reason: .micUnavailable)
+            return
+        }
+
+        engineRestarts += 1
+        Self.logger.notice("Rebuilding mic capture (attempt \(self.engineRestarts, privacy: .public))")
+        isClosing = true
+        stopEngine()
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.engineRestartDelay) { [weak self] in
+            guard let self, self.isListening, self.engine == nil else { return }
+            do {
+                try self.startEngine()
+            } catch {
+                Self.logger.error("Mic capture could not be restarted: \(error.localizedDescription, privacy: .public)")
+                self.cancelSession(reason: .micUnavailable)
             }
         }
     }
@@ -201,8 +316,7 @@ final class KonListener: @unchecked Sendable {
         guard isListening, !isClosing else { return }
         isClosing = true
         // Stop the tap first so the audio thread no longer touches the buffers.
-        engine?.inputNode.removeTap(onBus: 0)
-        engine?.stop()
+        stopEngine()
         if isCapturingUtterance, !utteranceSamples.isEmpty {
             finishUtterance()
         } else {
@@ -220,6 +334,13 @@ final class KonListener: @unchecked Sendable {
 
     private func stopMic() {
         guard isListening else { return }
+        stopEngine()
+        isListening = false
+    }
+
+    /// Tears the capture chain down but keeps the session alive, so it can be
+    /// rebuilt on a device that just changed underneath us.
+    private func stopEngine() {
         watchdog?.invalidate()
         watchdog = nil
         if let configurationObserver {
@@ -231,18 +352,19 @@ final class KonListener: @unchecked Sendable {
         engine?.reset()
         engine = nil
         converter = nil
-        isListening = false
+        converterInputFormat = nil
     }
 
     // MARK: - Audio tap (runs on CoreAudio's realtime callback thread)
 
     private func process(buffer: AVAudioPCMBuffer) {
-        guard !isClosing, let converter, let samples = Self.convert(buffer, with: converter, to: targetFormat) else { return }
+        guard !isClosing, let samples = convert(buffer) else { return }
 
         if audioStartedAt == nil {
             // Still warming up: the device is sending digital silence.
             guard samples.contains(where: { $0 != 0 }) else { return }
             audioStartedAt = CFAbsoluteTimeGetCurrent()
+            didHearAudioThisSession = true
             notifyState(.listening)
         }
 
@@ -356,6 +478,18 @@ final class KonListener: @unchecked Sendable {
     }
 
     // MARK: - Audio conversion
+
+    /// A converter is tied to one input format, and a Bluetooth profile switch
+    /// changes that mid-session, so build one per format as it turns up.
+    private func convert(_ buffer: AVAudioPCMBuffer) -> [Float]? {
+        if converter == nil || converterInputFormat != buffer.format {
+            guard let rebuilt = AVAudioConverter(from: buffer.format, to: targetFormat) else { return nil }
+            converter = rebuilt
+            converterInputFormat = buffer.format
+        }
+        guard let converter else { return nil }
+        return Self.convert(buffer, with: converter, to: targetFormat)
+    }
 
     private static func convert(_ buffer: AVAudioPCMBuffer, with converter: AVAudioConverter, to format: AVAudioFormat) -> [Float]? {
         let ratio = format.sampleRate / buffer.format.sampleRate

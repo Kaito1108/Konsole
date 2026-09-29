@@ -402,6 +402,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .cancelled: return nil
         case .noSpeech: return "何も聞こえなかったよ。もう一度話しかけてね。"
         case .micUnavailable: return "マイクの音が届かなかったよ。入力デバイスを確認してね。"
+        case .micDenied: return "マイクの使用が許可されていないみたい。システム設定 > プライバシーとセキュリティ > マイク でKonsoleをオンにしてね。"
         case .tooShort: return "短すぎて聞き取れなかったよ。"
         case .notUnderstood: return "うまく聞き取れなかったよ。もう一度話してね。"
         case .failed: return "文字起こしに失敗したよ。"
