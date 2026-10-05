@@ -8,6 +8,9 @@ final class ChatViewModel {
     private(set) var isSending = false
     private(set) var listenerState: KonListenerState = .idle
     private(set) var isSpeaking = false
+    /// The one-line text box is open; counts as busy so reminders wait and
+    /// the cancel key closes it.
+    private(set) var isComposing = false
     var errorMessage: String?
 
     /// Called when a spoken command is recognized, so the menu bar host
@@ -23,7 +26,7 @@ final class ChatViewModel {
     var onListeningEndedWithoutCommand: ((KonListenEndReason) -> Void)?
     /// Called with every completed reply, so the menu bar host can show it in
     /// the floating speech-bubble overlay regardless of where the send came from.
-    var onReply: ((KonReply) -> Void)?
+    var onReply: ((_ reply: KonReply, _ isSpoken: Bool) -> Void)?
     /// Called when the reply starts being read aloud, with the audio duration.
     var onSpeechStart: ((TimeInterval) -> Void)?
     /// Called when reading the reply aloud has finished.
@@ -68,6 +71,9 @@ final class ChatViewModel {
     private var streamedText = ""
     private var spokenStreamCount = 0
     private var isStreamingSpeech = false
+    /// Whether the reply in flight is read aloud: typed questions stay quiet
+    /// unless 設定 says otherwise.
+    private var speaksCurrentReply = true
     /// Waiting on 許可 / 拒否 for a tool call.
     private var pendingPermission: CheckedContinuation<Bool, Never>?
     private var permissionTimeoutTask: Task<Void, Never>?
@@ -123,7 +129,7 @@ final class ChatViewModel {
 
     var isListening: Bool { listener.isListening }
 
-    var isBusy: Bool { listener.isListening || listenerState != .idle || isSending || isSpeaking }
+    var isBusy: Bool { listener.isListening || listenerState != .idle || isSending || isSpeaking || isComposing }
 
     /// Starts a push-to-talk voice session, or cancels the one in progress.
     /// Pressed while Kon is thinking or speaking, it cuts Kon off and listens
@@ -155,6 +161,8 @@ final class ChatViewModel {
     /// Escape: stop whatever Kon is doing right now.
     func cancelCurrentActivity() {
         isContinuing = false
+        isComposing = false
+        updateBusy()
         if listener.isListening {
             listener.cancelSession()
             return
@@ -181,6 +189,30 @@ final class ChatViewModel {
                 speak(text)
             }
         }
+    }
+
+    // MARK: - 文字入力
+
+    /// The text box opened: whatever Kon was doing (listening, thinking,
+    /// talking) gives way, quietly, so the bubble can become the input.
+    func beginComposing() {
+        isContinuing = false
+        if listener.isListening {
+            listener.cancelSession()
+        }
+        answerPendingPermission(false)
+        interruptReply()
+        stopSpeaking()
+        isComposing = true
+        updateBusy()
+    }
+
+    /// Sends what was typed. Never opens the mic, and only reads the reply
+    /// aloud when 設定 asks for it.
+    func sendTyped(_ text: String) {
+        isComposing = false
+        send(text, speaks: settings.speakReplies && settings.speaksTypedReplies)
+        updateBusy()
     }
 
     private func interruptReply() {
@@ -284,9 +316,10 @@ final class ChatViewModel {
             streamedText += streamSegmentText
             spokenStreamCount = 0
         }
-        streamSegmentText = text
+        // Code blocks are for the clipboard, not for reading out.
+        streamSegmentText = KonReplyText(text).prose
         onStreamingReply?(text)
-        guard settings.speakReplies else { return }
+        guard speaksCurrentReply else { return }
         if !isStreamingSpeech {
             isStreamingSpeech = true
             isSpeaking = true
@@ -335,12 +368,15 @@ final class ChatViewModel {
 
     /// Reads out whatever is left of a streamed reply, plus the final text if
     /// it isn't what was streamed, and closes the queue.
-    private func endStreamedSpeech(finalText: String) {
+    private func endStreamedSpeech(finalText: String, didCopy: Bool) {
         flushSpeechStream(all: true)
         let spoken = streamedText + streamSegmentText
-        let text = finalText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = KonReplyText(finalText).prose.trimmingCharacters(in: .whitespacesAndNewlines)
         if !text.isEmpty, !spoken.contains(text) {
             speechClient.appendStream(text)
+        }
+        if didCopy {
+            speechClient.appendStream(Self.copiedRemark)
         }
         speechClient.endStream()
     }
@@ -362,9 +398,11 @@ final class ChatViewModel {
         KonProfileStore.shared.learnIfNeeded(conversationEnded: true)
     }
 
-    func send(_ text: String) {
+    /// `speaks`: read the reply aloud; nil follows the 返事を読み上げる setting.
+    func send(_ text: String, speaks: Bool? = nil) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !isSending else { return }
+        speaksCurrentReply = speaks ?? settings.speakReplies
 
         append(KonMessage(role: .user, text: trimmed))
         isSending = true
@@ -389,21 +427,23 @@ final class ChatViewModel {
                     guard let self else { return false }
                     return await requestPermission(request)
                 }
-                let reply = try await client.send(
+                let rawReply = try await client.send(
                     trimmed,
                     context: context,
                     onStream: onStream,
                     onPermission: onPermission
                 )
                 guard generation == sendGeneration else { return }
+                let (reply, didCopy) = Self.copyingSnippet(of: rawReply)
                 append(KonMessage(role: .kon, text: reply.text, actions: reply.actions))
-                onReply?(reply)
+                onReply?(reply, speaksCurrentReply)
                 KonProfileStore.shared.learnIfNeeded()
-                if settings.speakReplies {
+                if speaksCurrentReply {
                     if isStreamingSpeech {
-                        endStreamedSpeech(finalText: reply.text)
+                        endStreamedSpeech(finalText: reply.text, didCopy: didCopy)
                     } else {
-                        speak(reply.text)
+                        let prose = KonReplyText(reply.text).prose.trimmingCharacters(in: .whitespacesAndNewlines)
+                        speak(didCopy ? [prose, Self.copiedRemark].filter { !$0.isEmpty }.joined(separator: "\n") : prose)
                     }
                 } else {
                     // Nothing to wait for before listening again.
@@ -442,11 +482,27 @@ final class ChatViewModel {
             label = "エラー"
             speaks = false
         }
-        let isSpoken = speaks && settings.speakReplies
+        let isSpoken = speaks && speaksCurrentReply
         onFailure?(KonReply(text: message, actions: [label]), isSpoken)
         if isSpoken {
             speak(message)
         }
+    }
+
+    private static let copiedRemark = "コピーしといたよ。"
+
+    /// A reply that hands over exactly one command / path / code block puts it
+    /// on the clipboard right away, and says so in the bubble.
+    private static func copyingSnippet(of reply: KonReply) -> (KonReply, didCopy: Bool) {
+        guard let snippet = KonReplyText(reply.text).copyableSnippet else { return (reply, false) }
+        KonClipboardClient.copy(snippet)
+        let copied = KonReply(
+            text: reply.text,
+            actions: reply.actions + ["コピーしといた"],
+            modelLabel: reply.modelLabel,
+            wasStreamed: reply.wasStreamed
+        )
+        return (copied, true)
     }
 
     private func append(_ message: KonMessage) {
@@ -570,7 +626,7 @@ struct ChatView: View {
     private func sendCurrentInput() {
         let text = inputText
         inputText = ""
-        viewModel.send(text)
+        viewModel.sendTyped(text)
     }
 }
 

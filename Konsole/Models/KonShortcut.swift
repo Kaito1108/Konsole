@@ -11,6 +11,7 @@ struct KonShortcut: Codable, Equatable {
 
     static let defaultPushToTalk = KonShortcut(keyCode: UInt32(kVK_Space), modifiers: UInt32(optionKey), keyName: "Space")
     static let defaultCancel = KonShortcut(keyCode: UInt32(kVK_Escape), modifiers: 0, keyName: "esc")
+    static let defaultTextInput = KonShortcut(keyCode: UInt32(kVK_Space), modifiers: UInt32(optionKey | shiftKey), keyName: "Space")
 
     init(keyCode: UInt32, modifiers: UInt32, keyName: String) {
         self.keyCode = keyCode

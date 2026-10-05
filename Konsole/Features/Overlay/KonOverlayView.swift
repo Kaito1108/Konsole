@@ -74,17 +74,30 @@ struct KonOverlayView: View {
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
-                LyricsText(
-                    text: text,
-                    readingStartedAt: viewModel.readingStartedAt,
-                    readingDuration: viewModel.readingDuration,
-                    isStreaming: viewModel.isStreaming
-                )
+                let parsed = KonReplyText(text)
+                let prose = parsed.prose.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !prose.isEmpty {
+                    LyricsText(
+                        text: prose,
+                        readingStartedAt: viewModel.readingStartedAt,
+                        readingDuration: viewModel.readingDuration,
+                        isStreaming: viewModel.isStreaming
+                    )
+                }
+                ForEach(Array(parsed.codeBlocks.enumerated()), id: \.offset) { _, code in
+                    KonCodeBlockView(code: code)
+                }
+                if viewModel.canCopy {
+                    KonCopyButton(didCopy: viewModel.didCopy, action: viewModel.copyReply)
+                        .padding(.top, 2)
+                }
             }
             .padding(.horizontal, 18)
             .padding(.vertical, 14)
             .frame(maxWidth: 380, alignment: .leading)
             .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 20))
+        case .textInput:
+            KonTextInputView(viewModel: viewModel)
         case .permission(let summary, let detail):
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 6) {

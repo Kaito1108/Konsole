@@ -2,7 +2,8 @@ import AppKit
 import SwiftUI
 
 /// Owns the menu bar status item, chat popover and floating overlay directly
-/// via AppKit, and wires the ⌥Space push-to-talk hotkey to voice sessions.
+/// via AppKit, and wires the ⌥Space push-to-talk hotkey to voice sessions and
+/// the ⌥⇧Space hotkey to the typed one-line input.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
@@ -101,8 +102,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         chatViewModel.onPermissionRequest = { [weak self] request, decide in
             self?.askPermission(request, decide: decide)
         }
-        chatViewModel.onReply = { [weak self] reply in
-            self?.showReplyOverlay(reply)
+        chatViewModel.onReply = { [weak self] reply, isSpoken in
+            self?.showReplyOverlay(reply, isSpoken: isSpoken, isCopyable: true)
         }
         chatViewModel.onFailure = { [weak self] reply, isSpoken in
             self?.showReplyOverlay(reply, isSpoken: isSpoken)
@@ -125,6 +126,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Push-to-talk (⌥Space by default): the mic is only on during a voice session.
         hotKeyManager.register(.pushToTalk) { [weak self] in
             self?.chatViewModel.toggleVoiceSession()
+        }
+        // Typed input (⌥⇧Space by default) for when speaking isn't an option.
+        // It never opens the mic.
+        hotKeyManager.register(.textInput) { [weak self] in
+            self?.toggleTextInput()
+        }
+        overlayViewModel.onSubmitText = { [weak self] text in
+            self?.submitTypedText(text)
         }
 
         let reminders = KonReminderStore.shared
@@ -327,6 +336,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.setContentSize(NSSize(width: 520, height: 220))
         overlayPanel = panel
         positionOverlayPanel()
+        // Clicking into another app while the text box is open means "never mind".
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didResignKeyNotification,
+            object: panel,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.chatViewModel.isComposing else { return }
+                self.chatViewModel.cancelCurrentActivity()
+            }
+        }
+    }
+
+    // MARK: - Typed input (one-line box in the bubble)
+
+    /// Opens the text box where the bubble shows, or closes it if it's open.
+    /// The panel stays non-activating, so the app the user was in stays
+    /// frontmost (and is what the context snapshot sees); it only becomes key
+    /// so the field gets the keystrokes.
+    private func toggleTextInput() {
+        if chatViewModel.isComposing {
+            chatViewModel.cancelCurrentActivity()
+            return
+        }
+        overlayHideTask?.cancel()
+        chatViewModel.beginComposing()
+        overlayViewModel.hide()
+        overlayViewModel.showTextInput()
+        if !overlayPanel.isVisible {
+            positionOverlayPanel()
+        }
+        overlayPanel.ignoresMouseEvents = false
+        overlayPanel.makeKeyAndOrderFront(nil)
+    }
+
+    private func submitTypedText(_ text: String) {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            chatViewModel.cancelCurrentActivity()
+            return
+        }
+        chatViewModel.sendTyped(text)
+        // Give the keyboard back to the app the user was typing in before;
+        // ordering out is what makes the panel give up key status.
+        overlayPanel.orderOut(nil)
+        overlayPanel.ignoresMouseEvents = true
+        overlayViewModel.showThinking()
+        overlayPanel.orderFrontRegardless()
     }
 
     private func positionOverlayPanel() {
@@ -379,14 +435,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// `isSpoken`: whether the text is about to be read aloud, which then
     /// drives scrolling and hiding; otherwise it scrolls at reading pace.
-    private func showReplyOverlay(_ reply: KonReply, isSpoken: Bool? = nil) {
+    /// `isCopyable`: a real answer, so the bubble gets a コピー button and has
+    /// to take clicks; status messages keep letting clicks through.
+    private func showReplyOverlay(_ reply: KonReply, isSpoken: Bool? = nil, isCopyable: Bool = false) {
         overlayHideTask?.cancel()
-        overlayPanel.ignoresMouseEvents = true
+        overlayPanel.ignoresMouseEvents = !isCopyable
         overlayViewModel.showReply(
             text: reply.text,
             actions: reply.actions,
             isStreaming: reply.wasStreamed,
-            modelLabel: reply.modelLabel
+            modelLabel: reply.modelLabel,
+            isCopyable: isCopyable
         )
         showOverlay()
         if !(isSpoken ?? settings.speakReplies) {
@@ -421,9 +480,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         overlayHideTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(seconds))
             guard !Task.isCancelled else { return }
-            // Never pull a question out from under the user.
-            guard self?.overlayViewModel.isAskingPermission != true else { return }
+            // Never pull a question (or a half-typed one) out from under the user.
+            guard self?.overlayViewModel.isAskingPermission != true,
+                  self?.overlayViewModel.isTyping != true else { return }
             self?.overlayViewModel.hide()
+            self?.overlayPanel.ignoresMouseEvents = true
             self?.overlayPanel.orderOut(nil)
         }
     }
@@ -431,7 +492,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 /// The floating bubble's window. It normally lets clicks through to whatever is
 /// underneath (`ignoresMouseEvents`), and only takes them while the 許可 / 拒否
-/// buttons are up.
+/// or コピー buttons, or the text box, are up.
 private final class KonOverlayPanel: NSPanel {
     // A borderless panel can't become key by default, which would make the
     // first click on a button do nothing but focus the panel.
