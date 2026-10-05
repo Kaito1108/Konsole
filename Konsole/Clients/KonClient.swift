@@ -124,7 +124,8 @@ actor KonClient {
     - ユーザーが「詳しく」などと明示的に求めたときだけ長めに答えてよい。
     - ユーザー発言の先頭にある［現在日時］は参考情報。日付・時刻・曜日を聞かれたらツールを使わずそれで答える。
     - Gmail・カレンダーなど外部サービスの操作は composio のMCPツールを使う。未接続のサービスは、Konsoleの設定の「連携」から接続するよう伝える。
-    - ユーザー発言の先頭にある［作業状況］は、ユーザーが今見ているアプリ・ファイル・ページ・クリップボードの参考情報。「これ」「このファイル」「さっきコピーしたの」などの指示語はこれで解釈する。関係ないときは触れない。
+    - ユーザー発言の先頭にある［作業状況］は、ユーザーが今見ているアプリ・ファイル・ページ・選択中のテキスト・クリップボードの参考情報。「これ」「このファイル」「さっきコピーしたの」などの指示語はこれで解釈する。選択中のテキストがあれば「これ」はまずそれを指す。関係ないときは触れない。
+    - ［作業状況］に「画面の画像」のパスがあれば、それはユーザーが今見ているウィンドウのスクリーンショット。「このエラー何？」「これどう思う？」のように画面を見ないと答えられないときだけ、Readツールでその画像を開いて見る。テキストの情報で足りるときは開かない。画像は見るだけで、クリックや入力などの画面操作はしない。画像がなく画面を見る必要があるときは、見えていないことを一言伝えて、テキストを選択するかコピーしてもらう。
     - 「25分後に教えて」「17時に〇〇って言って」のようなタイマー・リマインダーは、Bashで open -g "konsole://remind?in=秒数&text=読み上げる一言" または open -g "konsole://remind?at=UNIX秒&text=読み上げる一言" を実行して登録する。textはURLエンコードし、時刻になったらそのまま読み上げられる一言にする（例: 25分たったよ、休憩しよう）。at は date -j -f "%Y-%m-%d %H:%M" "2026-01-01 17:00" +%s のように求める。
     - 登録済みリマインダーは \(KonReminderStore.fileURL.path(percentEncoded: false)) にJSONで保存されている。取り消しは open -g "konsole://remind/cancel?id=ID"、全部なら open -g "konsole://remind/cancel?all=1"。
     - ツールの実行がユーザーに拒否されたときは、やらなかったことを一言で伝えるだけにする。同じ操作をやり直したり、別の手で回避したりしない。
@@ -512,9 +513,13 @@ actor KonClient {
             prompt += "\n\n" + projects
         }
         let active = await KonSettings.shared.activeProject
-        let extraDirectories = await KonSettings.shared.usableProjects
+        var extraDirectories = await KonSettings.shared.usableProjects
             .map(\.expandedPath)
             .filter { $0 != active?.expandedPath }
+        // Lets Kon open the screenshot without a permission prompt.
+        if await KonSettings.shared.sharesScreenshot {
+            extraDirectories.append(KonScreenCapture.preparedDirectoryPath())
+        }
         return ProcessConfig(
             mcpConfig: mcpConfig,
             systemPrompt: prompt,

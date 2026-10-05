@@ -1,15 +1,25 @@
 import AppKit
 import ApplicationServices
 
+/// What the user is working on right now: text for the ［作業状況］ block, plus
+/// a screenshot file Kon may look at. Pass `screenshot` to
+/// `KonScreenCapture.discard` once the request is done.
+struct KonWorkContext {
+    let text: String?
+    let screenshot: URL?
+}
+
 /// A snapshot of what the user is working on, attached to each request so
 /// "これ直して" or "さっきコピーしたやつ" make sense to Kon. Strictly read-only:
-/// window titles and documents via Accessibility, Finder selection and
-/// browser tabs via AppleScript, and the clipboard. Nothing is clicked or typed.
+/// window titles, documents and selected text via Accessibility, Finder
+/// selection and browser tabs via AppleScript, the clipboard, and optionally a
+/// screenshot of the focused window. Nothing is clicked or typed.
 @MainActor
 final class KonContextProvider {
     static let shared = KonContextProvider()
 
     private static let clipboardCharacterLimit = 1500
+    private static let selectedTextCharacterLimit = 1500
     private static let finderSelectionLimit = 20
     private static let appleScriptTimeout: Duration = .seconds(1.5)
 
@@ -42,15 +52,16 @@ final class KonContextProvider {
         AXIsProcessTrustedWithOptions(options)
     }
 
-    /// Plain-text lines describing the current work context, or nil when
-    /// sharing is off or there's nothing to say.
-    func snapshot() async -> String? {
+    /// Plain-text lines describing the current work context (nil when sharing
+    /// is off or there's nothing to say), and a screenshot when that's on.
+    func snapshot() async -> KonWorkContext {
         let settings = KonSettings.shared
         var lines: [String] = []
+        let app = lastExternalApp.flatMap { $0.isTerminated ? nil : $0 }
+        let window = app.map(focusedWindowInfo(of:)) ?? (title: nil, documentPath: nil, frame: nil)
 
-        if settings.sharesAppContext, let app = lastExternalApp, !app.isTerminated {
+        if settings.sharesAppContext, let app {
             var line = "前面のアプリ: \(app.localizedName ?? app.bundleIdentifier ?? "不明")"
-            let window = focusedWindowInfo(of: app)
             if let title = window.title, !title.isEmpty {
                 line += "（ウィンドウ: \(title)）"
             }
@@ -63,29 +74,103 @@ final class KonContextProvider {
             }
         }
 
-        if settings.sharesClipboard, let clipboard = clipboardText() {
+        var selection: String?
+        if settings.sharesSelectedText, let app, !Self.isSensitive(app) {
+            selection = selectedText(of: app)
+            if let selection {
+                lines.append("選択中のテキスト:\n\(selection)")
+            }
+        }
+
+        // Skip the clipboard when it's just what's selected (copied a moment ago).
+        if settings.sharesClipboard, let clipboard = clipboardText(), clipboard != selection {
             lines.append("クリップボード:\n\(clipboard)")
         }
 
-        return lines.isEmpty ? nil : lines.joined(separator: "\n")
+        var screenshot: URL?
+        if settings.sharesScreenshot, let app, !Self.isSensitive(app) {
+            let capture = KonScreenCapture.shared
+            if capture.hasPermission {
+                screenshot = await capture.captureFocusedWindow(of: app, focusedFrame: window.frame)
+                if let screenshot {
+                    lines.append("画面の画像: \(screenshot.path(percentEncoded: false))（画面を見る必要があるときだけReadで開く）")
+                }
+            } else {
+                lines.append("画面の画像: なし（Konsoleに画面収録の許可がない）")
+            }
+        }
+
+        return KonWorkContext(text: lines.isEmpty ? nil : lines.joined(separator: "\n"), screenshot: screenshot)
+    }
+
+    /// Password managers: their windows and selections never leave the app,
+    /// the same care the clipboard gets from the nspasteboard markers.
+    private static let sensitiveApps: Set<String> = [
+        "com.1password.1password", "com.agilebits.onepassword7", "com.agilebits.onepassword-osx",
+        "com.bitwarden.desktop", "com.apple.keychainaccess", "com.apple.Passwords",
+        "com.dashlane.dashlanephonefinal", "com.lastpass.LastPass", "in.sinew.Enpass-Desktop",
+        "org.keepassxc.keepassxc", "com.keepersecurity.passwordmanager", "com.nordpass.macos.NordPass",
+        "com.proton.pass.electron"
+    ]
+
+    private static func isSensitive(_ app: NSRunningApplication) -> Bool {
+        app.bundleIdentifier.map(sensitiveApps.contains) ?? false
     }
 
     // MARK: - Accessibility
 
-    private func focusedWindowInfo(of app: NSRunningApplication) -> (title: String?, documentPath: String?) {
-        guard isAccessibilityTrusted else { return (nil, nil) }
-        let element = AXUIElementCreateApplication(app.processIdentifier)
-        var windowValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXFocusedWindowAttribute as CFString, &windowValue) == .success,
-              let windowValue, CFGetTypeID(windowValue) == AXUIElementGetTypeID() else { return (nil, nil) }
-        let window = windowValue as! AXUIElement
+    private func focusedWindowInfo(of app: NSRunningApplication) -> (title: String?, documentPath: String?, frame: CGRect?) {
+        guard isAccessibilityTrusted,
+              let window = elementAttribute(kAXFocusedWindowAttribute, of: AXUIElementCreateApplication(app.processIdentifier))
+        else { return (nil, nil, nil) }
 
         let title = stringAttribute(kAXTitleAttribute, of: window)
         // Document-based apps (Xcode, TextEdit, Preview, ...) expose the file URL.
         let documentPath = stringAttribute(kAXDocumentAttribute, of: window)
             .flatMap(URL.init(string:))
             .flatMap { $0.isFileURL ? $0.path(percentEncoded: false) : nil }
-        return (title, documentPath)
+        return (title, documentPath, frame(of: window))
+    }
+
+    /// Selected text in the focused field of `app`, so "これ直して" works
+    /// without ⌘C. Password fields are skipped; apps that don't expose their
+    /// text to Accessibility (some Electron / Chromium views) just give nil.
+    private func selectedText(of app: NSRunningApplication) -> String? {
+        guard isAccessibilityTrusted else { return nil }
+        let appElement = AXUIElementCreateApplication(app.processIdentifier)
+        // A hung app shouldn't hold up the request.
+        AXUIElementSetMessagingTimeout(appElement, 0.5)
+        guard let focused = elementAttribute(kAXFocusedUIElementAttribute, of: appElement),
+              stringAttribute(kAXSubroleAttribute, of: focused) != kAXSecureTextFieldSubrole,
+              let text = stringAttribute(kAXSelectedTextAttribute, of: focused)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !text.isEmpty else { return nil }
+        return text.count > Self.selectedTextCharacterLimit
+            ? String(text.prefix(Self.selectedTextCharacterLimit)) + "…（以下省略）"
+            : text
+    }
+
+    private func elementAttribute(_ attribute: String, of element: AXUIElement) -> AXUIElement? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success,
+              let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        return unsafeDowncast(value, to: AXUIElement.self)
+    }
+
+    /// Window frame in top-left global coordinates, like ScreenCaptureKit's.
+    private func frame(of window: AXUIElement) -> CGRect? {
+        var positionValue: CFTypeRef?
+        var sizeValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &positionValue) == .success,
+              AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeValue) == .success,
+              let positionValue, let sizeValue,
+              CFGetTypeID(positionValue) == AXValueGetTypeID(), CFGetTypeID(sizeValue) == AXValueGetTypeID()
+        else { return nil }
+        var origin = CGPoint.zero
+        var size = CGSize.zero
+        guard AXValueGetValue(unsafeDowncast(positionValue, to: AXValue.self), .cgPoint, &origin),
+              AXValueGetValue(unsafeDowncast(sizeValue, to: AXValue.self), .cgSize, &size) else { return nil }
+        return CGRect(origin: origin, size: size)
     }
 
     private func stringAttribute(_ attribute: String, of element: AXUIElement) -> String? {
