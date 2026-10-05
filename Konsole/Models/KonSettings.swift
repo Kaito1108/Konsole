@@ -37,6 +37,8 @@ final class KonSettings {
         static let streamsReplies = "streamsReplies"
         static let continuesConversation = "continuesConversation"
         static let continuousSilenceTimeout = "continuousSilenceTimeout"
+        static let sharesSelectedText = "sharesSelectedText"
+        static let sharesScreenshot = "sharesScreenshot"
         static let textInputShortcut = "textInputShortcut"
         static let speaksTypedReplies = "speaksTypedReplies"
     }
@@ -79,6 +81,14 @@ final class KonSettings {
     /// Tell Kon what's on the clipboard (secrets from password managers are skipped).
     var sharesClipboard: Bool {
         didSet { defaults.set(sharesClipboard, forKey: Key.sharesClipboard) }
+    }
+    /// Tell Kon what text is selected in the front app, so "これ直して" works without ⌘C.
+    var sharesSelectedText: Bool {
+        didSet { defaults.set(sharesSelectedText, forKey: Key.sharesSelectedText) }
+    }
+    /// Let Kon look at a screenshot of the focused window when it needs to.
+    var sharesScreenshot: Bool {
+        didSet { defaults.set(sharesScreenshot, forKey: Key.sharesScreenshot) }
     }
 
     /// What Kon calls the user ("カイト", "ボス"...). Empty = no name.
@@ -305,6 +315,8 @@ final class KonSettings {
             Key.streamsReplies: true,
             Key.continuesConversation: false,
             Key.continuousSilenceTimeout: 4.0,
+            Key.sharesSelectedText: true,
+            Key.sharesScreenshot: false,
             Key.speaksTypedReplies: false,
         ])
         speakReplies = defaults.bool(forKey: Key.speakReplies)
@@ -316,6 +328,8 @@ final class KonSettings {
         playsListeningSound = defaults.bool(forKey: Key.playsListeningSound)
         sharesAppContext = defaults.bool(forKey: Key.sharesAppContext)
         sharesClipboard = defaults.bool(forKey: Key.sharesClipboard)
+        sharesSelectedText = defaults.bool(forKey: Key.sharesSelectedText)
+        sharesScreenshot = defaults.bool(forKey: Key.sharesScreenshot)
         userCallName = defaults.string(forKey: Key.userCallName) ?? ""
         personaTone = defaults.string(forKey: Key.personaTone).flatMap(KonPersonaTone.init(rawValue:)) ?? .friendly
         personaNotes = defaults.string(forKey: Key.personaNotes) ?? ""

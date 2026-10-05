@@ -327,6 +327,7 @@ private struct UpdateCard: View {
 private struct WorkContextCard: View {
     @Bindable private var settings = KonSettings.shared
     @State private var isTrusted = KonContextProvider.shared.isAccessibilityTrusted
+    @State private var canCaptureScreen = KonScreenCapture.shared.hasPermission
 
     var body: some View {
         SettingsCard(title: "作業状況") {
@@ -352,13 +353,53 @@ private struct WorkContextCard: View {
             SettingRow(title: "クリップボードを伝える", detail: "コピーした内容を「これ」で扱えるようにします（パスワード管理アプリのコピーは除外）") {
                 Toggle("", isOn: $settings.sharesClipboard).labelsHidden()
             }
+            Divider()
+            SettingRow(title: "選択中のテキストを伝える", detail: "前面のアプリで選択している文字を、コピーしなくても「これ」で扱えるようにします（パスワード欄・パスワード管理アプリは除外）") {
+                Toggle("", isOn: $settings.sharesSelectedText).labelsHidden()
+            }
+            if settings.sharesSelectedText, !isTrusted {
+                permissionNote("選択中のテキストを読むにはアクセシビリティの許可が必要です") {
+                    KonContextProvider.shared.requestAccessibility()
+                }
+            }
+            Divider()
+            SettingRow(title: "画面を見せる", detail: "話しかけたときに前面のウィンドウを撮影し、必要なときだけコンが見ます。画像は一時フォルダに置き、返答が終わると削除します（パスワード管理アプリは撮りません）") {
+                Toggle("", isOn: $settings.sharesScreenshot).labelsHidden()
+            }
+            if settings.sharesScreenshot {
+                if canCaptureScreen {
+                    Label("画面収録許可済み", systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                        .font(.caption)
+                        .padding(.bottom, 6)
+                } else {
+                    permissionNote("画面収録の許可が必要です。許可がないあいだは画面を撮らずに答えます（許可後にKonsoleの再起動が必要な場合があります）") {
+                        KonScreenCapture.shared.requestPermission()
+                    }
+                }
+            }
         }
         .toggleStyle(.switch)
         .tint(SettingsPalette.accent)
         // Granting happens in System Settings; re-check when coming back.
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             isTrusted = KonContextProvider.shared.isAccessibilityTrusted
+            canCaptureScreen = KonScreenCapture.shared.hasPermission
         }
+        .onChange(of: settings.sharesScreenshot) { _, isOn in
+            if isOn, !canCaptureScreen { KonScreenCapture.shared.requestPermission() }
+        }
+    }
+
+    private func permissionNote(_ message: String, request: @escaping () -> Void) -> some View {
+        HStack(spacing: 8) {
+            Label(message, systemImage: "exclamationmark.circle")
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button("許可する", action: request)
+        }
+        .font(.caption)
+        .padding(.bottom, 6)
     }
 }
 
