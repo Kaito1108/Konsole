@@ -4,20 +4,22 @@ import Foundation
 /// Registers system-wide keyboard shortcuts via the classic Carbon hot key API —
 /// still the standard way to get a permission-free global shortcut on macOS
 /// (no Accessibility/Input Monitoring prompt required, unlike an NSEvent
-/// global monitor). Key combos come from KonSettings (⌥Space / Escape by
-/// default); the cancel key is registered only while a voice session is
-/// active, so it isn't swallowed from other apps the rest of the time.
+/// global monitor). Key combos come from KonSettings (⌥Space / ⌥⇧Space /
+/// Escape by default); the cancel key is registered only while Kon is busy or
+/// the text box is open, so it isn't swallowed from other apps the rest of the time.
 final class KonHotKeyManager {
     static let shared = KonHotKeyManager()
 
     enum HotKey: UInt32 {
         case pushToTalk = 1
         case cancel = 2
+        case textInput = 3
 
         var shortcut: KonShortcut {
             switch self {
             case .pushToTalk: return KonSettings.shared.pushToTalkShortcut
             case .cancel: return KonSettings.shared.cancelShortcut
+            case .textInput: return KonSettings.shared.textInputShortcut
             }
         }
     }

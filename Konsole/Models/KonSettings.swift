@@ -39,6 +39,8 @@ final class KonSettings {
         static let continuousSilenceTimeout = "continuousSilenceTimeout"
         static let sharesSelectedText = "sharesSelectedText"
         static let sharesScreenshot = "sharesScreenshot"
+        static let textInputShortcut = "textInputShortcut"
+        static let speaksTypedReplies = "speaksTypedReplies"
     }
 
     private let defaults: UserDefaults
@@ -260,6 +262,15 @@ final class KonSettings {
     var cancelShortcut: KonShortcut {
         didSet { saveShortcut(cancelShortcut, forKey: Key.cancelShortcut) }
     }
+    /// Opens the one-line text box, for when talking out loud isn't an option.
+    var textInputShortcut: KonShortcut {
+        didSet { saveShortcut(textInputShortcut, forKey: Key.textInputShortcut) }
+    }
+    /// Read replies to typed questions aloud too. Off by default: typing is
+    /// usually chosen precisely because it has to stay quiet.
+    var speaksTypedReplies: Bool {
+        didSet { defaults.set(speaksTypedReplies, forKey: Key.speaksTypedReplies) }
+    }
 
     /// Backed by SMAppService rather than UserDefaults, so it reflects what the
     /// user may have changed in System Settings > General > Login Items.
@@ -306,6 +317,7 @@ final class KonSettings {
             Key.continuousSilenceTimeout: 4.0,
             Key.sharesSelectedText: true,
             Key.sharesScreenshot: false,
+            Key.speaksTypedReplies: false,
         ])
         speakReplies = defaults.bool(forKey: Key.speakReplies)
         voicevoxSpeakerId = defaults.integer(forKey: Key.voicevoxSpeakerId)
@@ -335,6 +347,8 @@ final class KonSettings {
         overlayDisplay = defaults.string(forKey: Key.overlayDisplay).flatMap(KonOverlayDisplay.init(rawValue:)) ?? .mouse
         pushToTalkShortcut = Self.loadShortcut(from: defaults, forKey: Key.pushToTalkShortcut) ?? .defaultPushToTalk
         cancelShortcut = Self.loadShortcut(from: defaults, forKey: Key.cancelShortcut) ?? .defaultCancel
+        textInputShortcut = Self.loadShortcut(from: defaults, forKey: Key.textInputShortcut) ?? .defaultTextInput
+        speaksTypedReplies = defaults.bool(forKey: Key.speaksTypedReplies)
     }
 
     private func saveShortcut(_ shortcut: KonShortcut, forKey key: String) {

@@ -253,6 +253,11 @@ private struct GeneralPane: View {
                     Toggle("", isOn: $settings.speakReplies).labelsHidden()
                 }
                 Divider()
+                SettingRow(title: "文字で聞いたときも読み上げる", detail: "オフなら\(settings.textInputShortcut.displayString)で文字入力したときは吹き出しだけで答えます") {
+                    Toggle("", isOn: $settings.speaksTypedReplies).labelsHidden()
+                }
+                .disabled(!settings.speakReplies)
+                Divider()
                 SettingRow(title: "聞き取り開始の効果音", detail: "聞き始めたときに鳴らします") {
                     Toggle("", isOn: $settings.playsListeningSound).labelsHidden()
                 }
@@ -1013,16 +1018,25 @@ private struct ShortcutsPane: View {
                         shortcut: $settings.pushToTalkShortcut,
                         defaultShortcut: .defaultPushToTalk,
                         requiresModifier: true,
-                        conflictsWith: settings.cancelShortcut
+                        conflictsWith: [settings.cancelShortcut, settings.textInputShortcut]
                     )
                 }
                 Divider()
-                SettingRow(title: "コンを止める", detail: "聞き取り・考え中・読み上げ中だけ有効です") {
+                SettingRow(title: "文字で話しかける", detail: "声を出せない場所向け。吹き出しの位置に入力欄が出て、Enterで送ります") {
+                    ShortcutRecorder(
+                        shortcut: $settings.textInputShortcut,
+                        defaultShortcut: .defaultTextInput,
+                        requiresModifier: true,
+                        conflictsWith: [settings.pushToTalkShortcut, settings.cancelShortcut]
+                    )
+                }
+                Divider()
+                SettingRow(title: "コンを止める", detail: "聞き取り・考え中・読み上げ中と、文字の入力中だけ有効です") {
                     ShortcutRecorder(
                         shortcut: $settings.cancelShortcut,
                         defaultShortcut: .defaultCancel,
                         requiresModifier: false,
-                        conflictsWith: settings.pushToTalkShortcut
+                        conflictsWith: [settings.pushToTalkShortcut, settings.textInputShortcut]
                     )
                 }
             }
@@ -1036,7 +1050,7 @@ private struct ShortcutRecorder: View {
     @Binding var shortcut: KonShortcut
     let defaultShortcut: KonShortcut
     let requiresModifier: Bool
-    let conflictsWith: KonShortcut
+    let conflictsWith: [KonShortcut]
 
     @State private var isRecording = false
     @State private var monitor: Any?
@@ -1072,6 +1086,7 @@ private struct ShortcutRecorder: View {
                         shortcut = defaultShortcut
                         KonHotKeyManager.shared.refresh(.pushToTalk)
                         KonHotKeyManager.shared.refresh(.cancel)
+                        KonHotKeyManager.shared.refresh(.textInput)
                     } label: {
                         Image(systemName: "arrow.uturn.backward.circle.fill")
                             .foregroundStyle(.secondary)
@@ -1107,8 +1122,8 @@ private struct ShortcutRecorder: View {
             message = "⌥・⌘・⌃・⇧のどれかと組み合わせてください"
             return
         }
-        if candidate.keyCode == conflictsWith.keyCode && candidate.modifiers == conflictsWith.modifiers {
-            message = "もう一方のショートカットと同じです"
+        if conflictsWith.contains(where: { $0.keyCode == candidate.keyCode && $0.modifiers == candidate.modifiers }) {
+            message = "ほかのショートカットと同じです"
             return
         }
         shortcut = candidate
