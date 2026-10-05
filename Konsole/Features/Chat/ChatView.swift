@@ -376,6 +376,8 @@ final class ChatViewModel {
         Task {
             do {
                 let context = await contextProvider.snapshot()
+                // The screenshot is only for this request.
+                defer { KonScreenCapture.discard(context.screenshot) }
                 guard generation == sendGeneration else { return }
                 let streams = settings.streamsReplies
                 if streams { beginStreaming() }
@@ -391,7 +393,7 @@ final class ChatViewModel {
                 }
                 let reply = try await client.send(
                     trimmed,
-                    context: context,
+                    context: context.text,
                     onStream: onStream,
                     onPermission: onPermission
                 )
